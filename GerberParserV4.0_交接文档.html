@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GerberParserSmartV4.0 —— 交接文档</title>
+<style>
+  :root{
+    --bg:#ffffff; --bg2:#f7f7f5; --bg3:#f1efe8;
+    --tx:#1a1a19; --tx2:#5f5e5a; --tx3:#888780;
+    --bd:#e3e1da; --bd2:#b4b2a9;
+    --red:#a32d2d; --red-bg:#fcebeb;
+    --amber:#854f0b; --amber-bg:#faeeda;
+    --green:#0f6e56; --green-bg:#e1f5ee;
+    --blue:#185fa5; --blue-bg:#e6f1fb;
+    --mono:"Consolas","Cascadia Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);
+    font-family:-apple-system,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+    font-size:14px;line-height:1.7;}
+  .wrap{max-width:1040px;margin:0 auto;padding:40px 28px 80px}
+  h1{font-size:22px;font-weight:500;margin:0 0 6px;letter-spacing:-.2px}
+  h2{font-size:17px;font-weight:500;margin:44px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--bd)}
+  h3{font-size:15px;font-weight:500;margin:26px 0 8px}
+  h4{font-size:14px;font-weight:500;margin:18px 0 6px}
+  p{margin:8px 0}
+  .sub{color:var(--tx2);font-size:13px;margin-bottom:28px}
+  code{font-family:var(--mono);font-size:12.5px;background:var(--bg3);
+    padding:1px 5px;border-radius:4px;color:#444441}
+  pre{background:var(--bg2);border:1px solid var(--bd);border-radius:8px;
+    padding:14px 16px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;
+    line-height:1.6;margin:10px 0}
+  pre code{background:none;padding:0}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--bd);vertical-align:top}
+  th{font-weight:500;color:var(--tx2);background:var(--bg2);border-bottom:1px solid var(--bd2)}
+  .tag{display:inline-block;font-size:11.5px;font-weight:500;padding:1px 7px;
+    border-radius:20px;margin-right:6px;vertical-align:1px}
+  .t-done{background:var(--green-bg);color:var(--green)}
+  .t-warn{background:var(--amber-bg);color:var(--amber)}
+  .t-todo{background:var(--red-bg);color:var(--red)}
+  .note{background:var(--blue-bg);border-radius:10px;padding:14px 18px;margin:14px 0;font-size:13.5px}
+  .warn{background:var(--amber-bg);border-radius:10px;padding:14px 18px;margin:14px 0;font-size:13.5px}
+  .danger{background:var(--red-bg);border-radius:10px;padding:14px 18px;margin:14px 0;font-size:13.5px}
+  .ok{background:var(--green-bg);border-radius:10px;padding:14px 18px;margin:14px 0;font-size:13.5px}
+  ul,ol{margin:8px 0;padding-left:22px}
+  li{margin:4px 0}
+  .meta{font-size:12.5px;color:var(--tx3);font-family:var(--mono)}
+  .kbd{display:inline-block;font-family:var(--mono);font-size:11.5px;
+    border:1px solid var(--bd2);border-bottom-width:2px;border-radius:5px;
+    padding:0 6px;background:#fff;color:var(--tx2);line-height:18px}
+  .pit{background:var(--bg2);border-left:3px solid var(--bd2);border-radius:0 8px 8px 0;
+    padding:12px 16px;margin:12px 0}
+  .pit h4{margin:0 0 4px}
+  .pit p{margin:4px 0;font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>GerberParserSmartV4.0 交接文档</h1>
+<div class="sub">
+工程：<code>D:\MyWork\Gerber\选点软件\高清版V4\GerberParserV4.0</code><br>
+解决方案：<code>GerberParserSmartV4.0.sln</code> &nbsp;·&nbsp; 程序集：<code>GerberParserSmartV4.0</code><br>
+目标框架：<b>.NET Framework 4.8</b>（<code>WinExe</code>）&nbsp;·&nbsp; 最后更新：2026-09-19
+</div>
+
+<div class="warn">
+<b>2026-09-19 修复：「保存后底图消失」与「打开工程后选点不见了」</b><br>
+两个现象各自的根因都在 <code>MainForm.cs</code>，已改动并<b>编译验证</b>（<code>dotnet build</code>，
+0 warning / 0 error），共 13 处：
+<ol>
+<li><b>保存后 Gerber 底图消失</b> —— 「显示底图」开关在两套绘制路径下口径不一致：
+  <code>DrawGerberMode</code> <b>无条件</b>画底图（开关在 Gerber 模式下是死按钮，按了画面不动、
+  状态却已翻转），<code>DrawTemplateMode</code> 才读它。而「保存」会把绘制切到模板模式 →
+  那个早先按下却没生效的 <code>false</code> 突然生效。修：两处统一判 <code>_showBaseLayer</code>，
+  并让两个模式的绘制顺序对齐（底图 → 选点 → 限定框）。</li>
+<li><b>打开工程后选点不见</b> —— 两处叠加：
+  ① 保存落点条件里带了 <code>_isTemplateMode</code>，而它在「打开工程」时等于"有没有读到 circles.json"，
+  于是打开一个还没存过选点的目录、编辑完点保存，内容被写到参数设置的模板路径下<b>另起一份</b>；
+  ② 「上次工程」只在「打开工程」时记录，保存不记录 → 下次开机恢复的是旧目录，那里当然没有刚存的选点。
+  修：就地保存只看"有没有一个真实存在的工程目录"；保存 / 另存成功后把「上次工程」指向<b>实际落点</b>。</li>
+<li><b>顺带修掉的确定性缺陷</b>：<code>circles.json</code> 只认这一个名字（原来会拿目录里任意
+  <code>*.json</code> 凑数，读不出 Shapes 还完全静默）；选点对象与图形缓存的匹配加了"退化键"并
+  <b>回填图层</b>（老 json 没有 Layer 字段，原来打开后选点是"幽灵对象"，点一下就重复、再点取消不掉）；
+  <code>LoadSavedPath</code> 不再把默认保存路径写进 <code>_currentTemplatePath</code>（否则没打开工程时
+  点保存会在 <code>…\template\template</code> 下套一层）。</li>
+</ol>
+<b>接手后请按「六、交互规则速查」逐条实机验证</b>，日志照旧在 exe 目录 <code>logs\</code> 下。
+</div>
+
+<h2>一、这是什么</h2>
+
+<p>一个 <b>Gerber 选点工具</b>的桌面程序。工作流是：</p>
+
+<pre><code>打开 Gerber 底图  →  在图上挑出需要的焊盘 / 针位  →  存成「模板」</code></pre>
+
+<p>模板的产物是一个文件夹，里面是 <code>circles.json</code>（选中的点）+ 一份 Gerber 底图拷贝，供下游设备按模板定位。
+<b>使用者的时间几乎全花在"挑点"上</b>，所以这个软件的复杂度集中在选点交互，而不是解析或渲染。</p>
+
+<div class="note">
+<b>历史沿革（避免看不懂旧注释）：</b>这个工程原来基于 Halcon（<code>HOperatorSet</code> / <code>HWindowControl</code>），
+2026-09-18 已<b>彻底移除 Halcon 依赖</b>，改用自研控件库 <code>Korey.SmartWindow</code> 做 GDI+ 矢量自绘。
+代码里大量注释写着"原来用 Halcon 是怎么做的、为什么改"——那是有意保留的，别删。
+</div>
+
+<h2>二、5 分钟上手</h2>
+
+<h3>依赖</h3>
+<table>
+<tr><th style="width:32%">依赖</th><th>来源</th><th>说明</th></tr>
+<tr><td><code>Korey.SmartWindow.WinForms</code></td><td><code>lib\Korey.SmartWindow.WinForms.dll</code></td>
+<td>自研控件库（源码在 <code>D:\MyWork\Common</code>）。<b>画布本体</b>：世界坐标绘制、视口变换、框选、浮层工具栏都在这里</td></tr>
+<tr><td><code>GerberParserTool</code></td><td><code>bin\Debug\GerberParserTool.dll</code></td>
+<td>Gerber 解析器（<code>GerberParser</code> / <code>Aperture</code> / <code>ApertureShape</code> 来自它）。<b>⚠ 引用路径有问题，见第七节</b></td></tr>
+<tr><td><code>Newtonsoft.Json</code></td><td><code>packages\Newtonsoft.Json.13.0.4\</code></td><td>模板 JSON 读写</td></tr>
+</table>
+
+<h3>编译 / 运行</h3>
+<pre><code>用 VS 打开 GerberParserSmartV4.0.sln，选 Debug|AnyCPU（或 Debug|x64），F5
+
+注意：LangVersion 只在 x64 配置里显式声明为 7.3；
+     AnyCPU 配置没有这一项，走编译器默认值。</code></pre>
+
+<h3>日志在哪</h3>
+<p><code>KLog</code> 写文件到 <b>exe 所在目录</b>下的 <code>logs\yyyy-MM-dd.log</code>。
+选点、框选、保存、加载的关键动作都有记录 —— 包括框选的世界坐标范围、命中数量、限定是否解除、模板保存的实际落点。
+<b>排查问题先看这个日志</b>，比猜快得多。</p>
+
+<div class="danger">
+<b>⚠ 雷区：<code>bin\x64\Debug\Json\</code> 里是真实使用者的模板数据。</b>
+清理输出目录、重新编译、删 <code>bin</code> 之前必须确认它没被带走。这类数据不可再生。
+</div>
+
+<h2>三、代码地图</h2>
+
+<table>
+<tr><th style="width:26%">文件</th><th style="width:10%">行数</th><th>职责</th></tr>
+<tr><td><code>MainForm.cs</code></td><td>~2460</td>
+<td><b>几乎全部业务逻辑</b>：绘制回调、鼠标交互、选点、框选、模板存取、悬浮工具栏、右键菜单、启动记忆。所有代码改动基本都在这个文件里</td></tr>
+<tr><td><code>MainForm.Designer.cs</code></td><td>~430</td>
+<td>界面声明。参照它了解控件命名与布局坐标（右侧面板的分组位置都在这里）</td></tr>
+<tr><td><code>ShapeQuery.cs</code></td><td>~150</td>
+<td><b>几何判定</b>：<code>IsVisible</code>（图形与矩形相交）、<code>CollectVisible</code>（视口裁剪）、<code>HitTest</code>（命中测试，支持旋转椭圆 + 点击容差 + 返回最近）。改判定口径只改这里</td></tr>
+<tr><td><code>KLog.cs</code></td><td>~60</td>
+<td>文件日志。原来用 <code>Console.WriteLine</code>，在 <code>WinExe</code> 下输出全丢</td></tr>
+<tr><td><code>ParamsForm.cs</code></td><td>~215</td>
+<td>参数设置：模板保存路径、已选点颜色。含 Halcon 颜色名 ↔ <code>System.Drawing.Color</code> 的双向转换</td></tr>
+<tr><td><code>PublicMethod.cs</code></td><td>~90</td>
+<td>零散辅助：<code>CircleConvertToApertures</code>、日志输出、设置初始化</td></tr>
+<tr><td><code>Program.cs</code></td><td>23</td>
+<td>入口。<b>注意 <code>Program.FileName</code> 这个静态字段</b>，见第七节</td></tr>
+</table>
+
+<h3>MainForm.cs 里的关键成员</h3>
+<table>
+<tr><th style="width:34%">成员</th><th>说明</th></tr>
+<tr><td><code>_allShapes</code></td><td><b>全量图形缓存</b>，只在解析 Gerber / 加载模板后构建一次。命中测试、框选、右键菜单都用它</td></tr>
+<tr><td><code>_selectedCircles</code></td><td>已选点集合。模板模式下它同时就是"模板包含的全部点"</td></tr>
+<tr><td><code>_actualSelectedRect</code></td><td><b>框选限定</b>的范围（原始坐标系）。空 = 无限定</td></tr>
+<tr><td><code>_regionUndoStack</code></td><td>框选撤销栈（深度 20）。只记框选，逐点点选不入栈</td></tr>
+<tr><td><code>_contentBounds</code></td><td>内容包围盒缓存。镜像变换与视图适配都用它</td></tr>
+<tr><td><code>_currentTemplatePath</code><br><code>_isTemplateMode</code></td><td><b>模板归属</b>：当前在编辑哪个模板文件夹。"保存"存回哪里由它决定</td></tr>
+<tr><td><code>_isSingleClickMode</code></td><td>点击语义：true = 单选（切换一个点），false = 多选（切换同类一批）</td></tr>
+<tr><td><code>_overlayToolbar</code></td><td>画布上沿的悬浮工具栏（运行时创建，设计器无法序列化）</td></tr>
+<tr><td><code>_canvasMenu</code></td><td>右键菜单。每次右键重建（内容随上下文变），旧的先 Dispose</td></tr>
+</table>
+
+<h2>四、核心数据流</h2>
+
+<pre><code>Gerber 文件
+   │  GerberParser.ParseFile()
+   ▼
+_apertures : List&lt;Aperture&gt;        （光圈：形状 + 尺寸 + 全部位置）
+   │  BuildAllShapes()   ← 只在解析/加载后跑一次
+   ▼
+_allShapes : List&lt;SelectedCircle&gt; （扁平成一个个可点的图形）
+   │  UpdateContentBounds()
+   ▼
+_contentBounds                     （算一次，绘制/适配复用）
+
+交互改动的是 SelectedCircle.IsSelected 与 _selectedCircles
+
+_selectedCircles
+   │  SaveTemplateToPath()
+   ▼
+模板文件夹\circles.json  +  底图.gbr</code></pre>
+
+<div class="pit">
+<h4>SelectedCircle 有两个"选中"表达，必须同步</h4>
+<p><code>SelectedCircle.IsSelected</code>（对象上的标志，管绘制）与 <code>_selectedCircles</code>（集合成员，管保存）
+是<b>两份状态</b>。任何一处改动都要同时改另一处，否则会出现"看起来选中了但保存没写进去"，或者反过来的
+"清空之后框选一个都不响应"（<code>IsSelected</code> 残留 true，被当成已选中而跳过）。</p>
+<p>历史上就踩过一次：<code>ClearAllSelection()</code> 是为此而生的 —— 它同时复位 <code>_allShapes</code> 上的标志、
+清空集合、清掉撤销栈。<b>要清空选择请一律走它，不要直接 <code>_selectedCircles.Clear()</code>。</b></p>
+</div>
+
+<h2>五、关键设计决策（以及踩过的坑）</h2>
+
+<p>这一节是这份文档最该读的部分。每条都是"当时为什么这么定"——不知道这些，很容易改回去。</p>
+
+<div class="pit">
+<h4>1. 选点不要门禁</h4>
+<p>曾经有过一个 <code>_isSelectingMode</code>「选点模式」开关，要先点「锁定」按钮进入，退出后左键点击毫无反应。
+用户的第一反应是"软件坏了"。<b>已彻底删除</b>：左键任何时候都能选点，单选 / 多选只是"点一下的语义差异"，不是开关。</p>
+<p><b>教训：不要让用户"先进入某个模式才能操作"，也不要把状态藏起来不给反馈。</b></p>
+</div>
+
+<div class="pit">
+<h4>2. 框选 = 选择；框选限定 = 作用范围</h4>
+<p>原始设计里"框选区域"只做一件事：<b>把点击可达范围缩小到框内</b>。它不选中任何东西，而框外点击会静默失效 ——
+用户必须先"清除区域"才能去别处点。这是最被诟病的地方。</p>
+<p>但直接把区域删掉也不行：它顺带提供了"<b>在区域内按类型批量操作</b>"的能力，而这个能力是真有用的
+（比如一片区域里 A、B 要、C 不要 —— 框定范围后点一下 C 就能清掉区域内全部 C）。</p>
+<p><b>最终拆成两件事：</b></p>
+<ul>
+<li><b>框选</b> → 框内图形一次性全部选中（累积，只增不减；<span class="kbd">Ctrl</span>+<span class="kbd">Z</span> 可撤销）</li>
+<li><b>框选限定</b> → 最近一次框选留下的矩形，<b>只限定"多选时同类扩散的范围"</b>，<b>不再拦截点击命中</b></li>
+</ul>
+<p>画面上保留一个红框作为限定的指示灯：<b>框在 = 限定生效，框不在 = 作用于全板</b>，两者严格同步。</p>
+</div>
+
+<div class="pit">
+<h4>3. 规则只能有一条：点到框外就解除限定</h4>
+<p>中途曾实现成"多选会解除限定、单选不解除"（理由是想保留限定方便继续在框内多选）。
+结果是同一个动作（点框外）在不同点击方式下行为不同 —— 用户直接当成 bug 报回来。</p>
+<p><b>现在统一由 <code>ReleaseScopeIfOutside()</code> 处理，所有入口（左键单选 / 左键多选 / 右键菜单）共用。</b>
+加新交互时也走它，别再写第二份判定。</p>
+</div>
+
+<div class="pit">
+<h4>4. 性能：三处 O(N²) 都在 09-18 修掉了</h4>
+<table>
+<tr><th style="width:30%">位置</th><th>原来的代价</th><th>现在的做法</th></tr>
+<tr><td>每帧重建全部图形</td><td>每次鼠标点击重建 15,359 个对象，每个还要在已选集合里线性查 → 约 2,960 万次比较 / 次点击</td><td><code>_allShapes</code> 构建一次；绘图只画可见范围</td></tr>
+<tr><td>每帧算包围盒</td><td>绘制循环里为每个图形各算一次 → 约 2.36 亿次迭代 / 帧（这就是"一点翻转就卡死"的根因）</td><td><code>_contentBounds</code> 缓存</td></tr>
+<tr><td>框选时逐个去重</td><td>去重函数是线性扫描，框 k 个就是 O(k·n)；3,852 点的板全选约 1,480 万次多字段比较（可见卡顿）</td><td>一次性构建 <code>HashSet</code>（键 <code>(X,Y,Shape)</code>，与缓存索引键一致）→ O(n+m+k)</td></tr>
+</table>
+<p><b>量级提醒：</b>真实板子上有 1.5 万级图形、模板点 3,852 个。任何"每帧 / 每次点击对全量做循环"的写法都要先算一笔账。</p>
+</div>
+
+<div class="pit">
+<h4>5. 画布背景是纯黑，颜色不能随便挑</h4>
+<p><code>kWindowControl1.WindowBackColor = Color.Black</code>。光圈配色表（<code>MainForm.ApertureColors</code>）
+已按"对纯黑对比度 ≥ 4.5:1"筛过一遍，剔除了 <code>blue</code> / <code>dim gray</code> / <code>slate blue</code> /
+<code>dark olive green</code> 四个。</p>
+<p>阈值取 4.5:1 而不是非文本图形常用的 3:1，因为<b>光圈是描边绘制的细轮廓</b>（<code>SetDraw("margin")</code>），比色块更难看清。
+改配色前先算一遍对比度。</p>
+</div>
+
+<div class="pit">
+<h4>6. GDI+ 的 <code>Color.Green</code> 不是 Halcon 的 <code>green</code></h4>
+<p>Halcon 调色板的 <code>green</code> 是纯绿 <b>(0,255,0)</b>，而 GDI+ 的 <code>Color.Green</code> 是 <b>(0,128,0)</b>，
+明显发暗。控件库 <code>KWindow.ParseColor</code> 按 Halcon 语义做了覆盖，但
+<code>ParamsForm.HalconColorToSystemColor</code> 里曾漏了一处（预览色块比画布暗），已修。</p>
+<p><b>加新的颜色转换时，两头都要按 Halcon 语义对齐。</b></p>
+</div>
+
+<div class="pit">
+<h4>7. "保存模板"是就地保存，落点必须可见</h4>
+<p>规则：<b>当前有模板归属就存回它所在目录</b>（不管它在桌面还是哪）；只有"刚从 Gerber 模式新建"时才落到
+参数设置里的模板路径。判断依据之一曾经是"文本框里的名字与当前模板文件夹名是否相同"——这个隐式条件让用户完全看不懂存到哪去了。</p>
+<p>现在覆盖确认框会显示<b>完整路径</b>，状态栏也显示完整路径。另外「另存到」之后会把模板归属指到新位置
+（原来漏了这步，导致另存后再点「保存」写回旧目录）。</p>
+<p><b>2026-09-19 补：判断依据只能看"有没有一个真实存在的工程目录"，不能绕道别的状态位。</b>
+当时的写法是 <code>if (_isTemplateMode &amp;&amp; _currentTemplatePath 非空)</code>，而
+<code>_isTemplateMode</code> 在「打开工程」时被赋成 <code>restoredSelection</code> ——
+也就是"那个目录里读没读到 circles.json"。于是<b>打开一个还没存过选点的目录</b>（原始 Gerber 素材目录
+正是这种）编辑完点「保存」，程序不写回打开的目录，而是跑到参数设置的模板路径下另起一份。用户以为
+存回了打开的工程，下次再打开那里选点是空的。现在条件简化成
+<code>!string.IsNullOrEmpty(_currentTemplatePath) &amp;&amp; Directory.Exists(_currentTemplatePath)</code>。</p>
+<p><b>配套的一条：保存成功后必须调 <code>RememberLastProject("template", targetFolder)</code>。</b>
+原来只有「打开工程」记「上次工程」，所以"打开的是 A、存的是 B"之后，下次开机自动恢复的是 A ——
+A 里没有刚存的选点，用户看到的就是"选点不见了"。落点在哪，「上次工程」就该指哪。</p>
+</div>
+
+<div class="pit">
+<h4>8. 原子写文件</h4>
+<p><code>WriteFileAtomic</code>：先写同目录 <code>.tmp</code>，再 <code>File.Replace</code> 替换。
+原实现在 <code>File.Delete</code> 与 <code>File.WriteAllText</code> 之间有危险窗口 —— 崩在中间会让模板只剩 Gerber 而 JSON 已丢，
+原数据不可恢复。<b>改文件写入时别退回直接 <code>WriteAllText</code>。</b></p>
+</div>
+
+<div class="pit">
+<h4>9. 浮层工具栏的"视口让位"是控件库能力，不要自己算</h4>
+<p><code>AttachOverlayToolbar(toolbar, ToolbarEdge.Top)</code> 会自动同步 <code>ViewPadding</code>，
+让 <code>FitToWindow</code> 把内容居中到"工具栏没占的那块"——<b>工具栏只压留白、不压图</b>。
+手动调 padding 反而会打架。</p>
+<p>另：工具栏按钮是<b>运行时按需生成</b>的，设计器无法序列化，所以它刻意留在代码里（<code>BuildOverlayToolbar()</code>），
+不在 <code>Designer.cs</code> 里。</p>
+</div>
+
+<h2>六、交互规则速查（改交互前先看这张表）</h2>
+
+<h3>框选限定</h3>
+<table>
+<tr><th style="width:26%">当前状态</th><th style="width:37%">左键单选</th><th>左键多选</th></tr>
+<tr><td>无框选限定</td><td>切换<b>这一个</b>点</td><td>切换<b>全板</b>同类点</td></tr>
+<tr><td>有框选限定，点在<b>框内</b></td><td>切换这一个点（<b>限定不影响单选</b>）</td><td>只切换<b>框内</b>同类点，框保留</td></tr>
+<tr><td>有框选限定，点在<b>框外</b></td><td>切换这一个点 + <b>解除限定</b>（框消失）</td><td><b>解除限定</b>后按<b>全板</b>切换同类</td></tr>
+</table>
+<p><b>点击命中永远不受限定影响</b>——框外一直点得中。这是与旧设计最本质的区别。</p>
+
+<h3>快捷键</h3>
+<table>
+<tr><th style="width:26%">按键</th><th>作用</th></tr>
+<tr><td><span class="kbd">Q</span></td><td>进入框选</td></tr>
+<tr><td><span class="kbd">Esc</span></td><td>取消进行中的框选 → 否则解除框选限定</td></tr>
+<tr><td><span class="kbd">空格</span></td><td>解除框选限定</td></tr>
+<tr><td><span class="kbd">Ctrl</span>+<span class="kbd">Z</span></td><td>撤销上一次框选（卸载栈深 20）</td></tr>
+<tr><td><span class="kbd">F1</span></td><td>操作说明</td></tr>
+<tr><td>滚轮 / 右键拖拽 / 中键</td><td>缩放（以光标为锚点）/ 平移 / 重置视图</td></tr>
+<tr><td>右键单击（未拖动）</td><td>弹出上下文菜单。拖动超过 3px 就是平移（<code>PanDragThreshold</code>），不会误弹</td></tr>
+</table>
+
+<h3>「显示底图」开关</h3>
+<p>真值只有一个字段 <code>_showBaseLayer</code>，三个入口（画布悬浮工具栏的 toggle、菜单「视图 → 显示底图」、
+画布右键菜单）全部走 <code>SetShowBaseLayer()</code>，靠 <code>_syncingBaseLayer</code> 挡回环。</p>
+<table>
+<tr><th style="width:34%">绘制路径</th><th>是否读这个开关</th></tr>
+<tr><td><code>DrawGerberMode</code>（Gerber 模式）</td><td><b>读</b>（2026-09-19 起）</td></tr>
+<tr><td><code>DrawTemplateMode</code>（模板模式）</td><td><b>读</b></td></tr>
+</table>
+<div class="danger">
+<b>这两行必须永远保持一致。</b>曾经 <code>DrawGerberMode</code> 是无条件画底图的 ——
+那让这个开关在 Gerber 模式下变成死按钮：按下去画面不动、状态栏也不动，用户以为按钮坏了；
+但状态已经翻转成 <code>false</code>，等到某个动作把绘制切到模板模式（<b>点一次「保存」就会</b>），
+那个迟到的 <code>false</code> 突然生效 —— 表现为"保存后 Gerber 底图消失"。
+<b>一个开关只允许有一套口径：不显示就是不显示</b>，现在按下当场生效，并有状态栏回执。
+</div>
+<p>另外两个绘制路径的<b>顺序</b>也必须一致：<b>底图 → 选点 → 框选限定框</b>（先画的在下层）。
+模板模式原来把底图放在最后画，等于把光圈描边叠在已选点上层，于是"保存前 / 保存后"观感不同 ——
+绘制内容不该因为存了一次盘而变样。</p>
+
+<div class="pit">
+<h4>同步 toggle 时一定要防递归</h4>
+<p>工具栏的 toggle 与界面上的 RadioButton 共享同一份状态，互相赋值会触发对方的 <code>CheckedChanged</code>，
+形成"点 A 设 B、B 的回调又把 A 设回来"的回环。<code>SetClickMode</code> / 底图开关都用
+<code>_syncingClickMode</code> / <code>_syncingBaseLayer</code> 标志包住 —— 加新的双向同步时照做。</p>
+</div>
+
+<h2>七、雷区（容易踩，别踩）</h2>
+
+<div class="danger">
+<h4>1. <code>bin\x64\Debug\Json\</code> 是使用者的模板数据</h4>
+<p>不可再生。清理 <code>bin</code>、重编、改输出路径之前都要确认它安全。</p>
+</div>
+
+<div class="ok">
+<h4>2. 不可还原的依赖必须放 <code>lib\</code>（2026-09-19 已修）</h4>
+<p><code>GerberParserTool.dll</code>（28,672 B）原来从 <code>bin\Debug\</code> 引用，而 <code>bin/</code>
+已在 <code>.gitignore</code> 里 —— 后果是<b>克隆仓库后直接编译不过</b>，且清空 <code>bin</code> 后同样编不过。
+现已挪到 <code>lib\</code> 并改 <code>HintPath</code>，与 <code>Korey.SmartWindow.WinForms.dll</code> 同一做法。</p>
+<p>判据就一条：<b>能不能由 NuGet 还原？</b> 能 → 走 <code>packages/</code> 并忽略；
+不能 → 放 <code>lib\</code> 并<b>进版本库</b>。
+（GerberParserTool 的 <b>pdb 刻意不带来</b>：调试符号里嵌着源码机器的绝对路径，
+对使用方无用，还会泄露目录布局 —— dll 本身不需要它。）</p>
+</div>
+
+<div class="danger">
+<h4>3. <code>Program.FileName</code> 仍是隐式全局状态</h4>
+<p>跨类使用的静态字段（<code>MainForm</code> 之外也有引用），<b>这一条坑还在</b>：
+任何一处悄悄改了它，别的读取点都会受影响。真正的状态源应该是 <code>_currentTemplatePath</code>（工程归属）。</p>
+<p><b>默认值那一条已修</b>（2026-09-19）：原来是原开发者本机的一个绝对路径
+（形如 <code>C:/Users/&lt;用户名&gt;/Desktop/&lt;工程&gt;/Gerber/&lt;文件&gt;.GBS</code>），
+换机必然失效，而且这个字符串会进版本库、把本机用户名公开出去。现在默认值是
+<code>string.Empty</code> —— 下游的读取点本来就是按 <code>string.IsNullOrEmpty</code> 判状态的，
+空串是它们的<b>预期取值</b>，不是缺值。</p>
+<p>同一轮还删掉了 <code>MainForm.GetGerberBrowseStartPath()</code> 里那条硬编码兜底目录
+（同样是本机路径），现在退到 <code>Environment.SpecialFolder.DesktopDirectory</code>。</p>
+</div>
+
+<div class="warn">
+<h4>4. 本工程源码是 <b>UTF-8 带 BOM + CRLF</b></h4>
+<p>批量改文件时务必保持。用脚本改的话：读进来之后按首 3 字节判断 BOM 再写回，
+换行统一成 CRLF。把它改成 LF 会让整个文件的 diff 爆炸。</p>
+</div>
+
+<div class="ok">
+<h4>5. 沙盒里其实能编译 —— 用 <code>dotnet build</code>，绕开 <code>MSBuild.exe</code></h4>
+<p><code>MSBuild.exe</code> 会被某些受限环境判定为受限二进制（LOLBin）拦下，但
+<code>dotnet build GerberParserSmartV4.0.csproj -c Debug -p:Platform=x64</code> 走的是<b>托管版
+MSBuild</b>（<code>MSBuild.dll</code>），完全可用。2026-09-19 实测：本工程（老式非 SDK 风格 csproj +
+packages.config）<b>约 2 秒，0 warning / 0 error</b>。前提是本机有 v4.8 targeting pack
+（<code>C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.8</code>）。
+<b>所以"改完能不能编"本身是可以先验证的，别把它整个推给接手的人。</b></p>
+<p>注意 <code>-c Debug</code> 不带 <code>-p:Platform</code> 时走 <code>Debug|AnyCPU</code> →
+输出到 <code>bin\Debug\</code>；要复现真实运行配置请显式加 <code>-p:Platform=x64</code>。
+另外想完全不碰既有输出目录，可以加
+<code>-p:OutputPath=&lt;临时目录&gt;\</code>（全局属性会覆盖 csproj 里的赋值）。</p>
+</div>
+
+<div class="danger">
+<h4>6. <code>_isTemplateMode</code> 不是"有没有打开工程"</h4>
+<p>它现在的实际含义只是<b>绘制选点的口径</b>（模板模式画全部模板点 / Gerber 模式只画已选中的），
+而且在「打开工程」时等于 <code>restoredSelection</code>（那个目录里<b>有没有读到 circles.json</b>）。
+把"工程是否已打开"或"保存该往哪写"挂在它上面，就会得到"打开一个没有选点的目录 → 保存跑到别处"这种结果
+（见第五节第 7 条的 09-19 补记）。<b>要判断工程归属，只看 <code>_currentTemplatePath</code> 有没有指向一个真实存在的目录。</b></p>
+</div>
+
+<div class="danger">
+<h4>7. 选点对象必须是图形缓存里的同一个实例</h4>
+<p><code>_selectedCircles</code> 里的 <code>SelectedCircle</code> 与 <code>_allShapes</code> 里的必须是<b>同一批对象</b>。
+原因很硬：<code>HandleSingleSelect</code> 用 <code>List.Remove(clicked)</code> 取消选中，<b>比较的是引用</b>；
+一旦是两份实例，就表现为"点一下能选中、再点一下取消不掉"，而且同一位置会被画两遍。</p>
+<p>保证它的机制在 <code>BuildAllShapes()</code>：用两级索引（<b>①图层+坐标+形状</b> 与
+<b>②坐标+形状</b>）去复用已选点对象。② 是为了兜住 <b>v2.2 以前没有 <code>Layer</code> 字段的
+circles.json</b> —— 那种文件恢复出来的选点 Layer 全是空串，只靠 ① 永远匹配不上。
+命中 ② 时会顺手把真实图层<b>回填</b>进选点；保存端从 v2.2 起写 <code>Layer</code>，闭环。</p>
+<p>坐标比对用 <code>Math.Round(…, 4)</code>：保存端就是这个精度，两边做同一次舍入 → 精确相等，不需要容差。
+<b>改坐标精度时两处必须一起改</b>，否则又会对不上号。</p>
+</div>
+
+<h2>八、已知遗留</h2>
+
+<table>
+<tr><th style="width:22%">项</th><th style="width:10%">优先级</th><th>说明</th></tr>
+<tr><td>旧「加载模板」入口成了死代码</td><td><span class="tag t-warn">中</span></td>
+<td><code>btnLoadTemple_Click</code> / <code>LoadTemplateFile</code> / <code>LoadTemplateFromFolder</code>
+<b>已无任何调用点</b>（设计器里没有按钮接它了），「打开工程」完全覆盖了它的职责。
+需要注意的是它的 json 兜底还是老口径（<code>Directory.GetFiles(folder, "*.json")[0]</code>），
+留着以后容易被误接上线 —— 确认无用后可整段删除</td></tr>
+<tr><td><code>GerberParserTool</code> 引用路径</td><td><span class="tag t-done">已修</span></td>
+<td>2026-09-19 已挪进 <code>lib\</code> 并改 <code>HintPath</code> —— 见第七节第 2 条</td></tr>
+<tr><td><code>Program.FileName</code> 默认值</td><td><span class="tag t-done">已修</span></td>
+<td>2026-09-19 改为 <code>string.Empty</code>；<code>GetGerberBrowseStartPath()</code> 里那条硬编码兜底目录同批删除</td></tr>
+<tr><td>无全局异常处理</td><td><span class="tag t-warn">中</span></td>
+<td><code>Program.Main</code> 没挂 <code>Application.ThreadException</code>，未捕获异常会走 WinForms 默认错误框，信息不落地。建议补上并写进 <code>KLog</code></td></tr>
+<tr><td>「图层」面板是空的</td><td><span class="tag t-warn">中</span></td>
+<td><code>groupBox4</code> 预留位，尚无任何子控件。此外底部还有一组 <code>rbLayerSelectYes/No</code> 与它同名概念（"底图显示"），命名容易混</td></tr>
+<tr><td>DPI 感知缺失</td><td><span class="tag t-warn">中</span></td>
+<td><code>App.config</code> 里没有 DPI 感知声明。"高清版"在缩放显示器上会被系统位图拉伸，矢量优势打折扣</td></tr>
+<tr><td>选中 / 未选中视觉同色</td><td><span class="tag t-todo">低</span></td>
+<td>模板模式下两者用同一个颜色画，只能靠框选限定与状态栏数量区分</td></tr>
+<tr><td>JSON 还走 <code>dynamic</code></td><td><span class="tag t-todo">低</span></td>
+<td><code>JsonConvert.DeserializeObject</code> + <code>dynamic</code> 访问字段，拼错字段名要到运行时才报错。可以换成强类型类</td></tr>
+</table>
+
+<h2>九、参考文档</h2>
+
+<table>
+<tr><th style="width:38%">文档</th><th>内容</th></tr>
+<tr><td><code>GerberParserV4.0_功能说明.html</code></td><td><b>面向使用者</b>：完整功能清单、快捷键、数据格式、性能要点、光圈配色依据</td></tr>
+<tr><td><code>Halcon替换为Korey_SmartWindow迁移说明.html</code></td><td>去 Halcon 化那次改动的完整记录（控件库 API 对照、踩过的坑）</td></tr>
+<tr><td><code>GerberParserV4.0_代码审查与WPF渲染可行性.html</code></td><td>更早的一次代码审查结论（性能问题的原始分析，很多已被本轮修掉）</td></tr>
+<tr><td><code>D:\MyWork\Common\Korey.SmartWindow.API.md</code></td><td><b>控件库 API 契约</b>。改画布相关代码前必读</td></tr>
+<tr><td><code>.workbuddy\memory\2026-09-18.md</code></td><td>本次全部改动的逐条记录（含每处改动的理由与自检结果）</td></tr>
+</table>
+
+<div class="ok">
+<b>最后一条建议：</b>接手后先把「五、关键设计决策」整节读完再动手。
+这份代码里很多看起来"绕"的写法，都是为了绕开一个具体的坑 —— 那些坑多半在注释里写了原因，
+<b>删之前先读一下注释</b>。
+</div>
+
+<p class="meta">文档更新：2026-09-19 · 基于源码 MainForm.cs (~3600 行) / MainForm.Designer.cs / ShapeQuery.cs / ParamsForm.cs / Program.cs / FolderPicker.cs / GerberParserSmartV4.0.csproj</p>
+
+</div>
+</body>
+</html>

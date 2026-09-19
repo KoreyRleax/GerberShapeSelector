@@ -1,0 +1,23 @@
+# 行尾策略：仓库一律存 LF；工作区由 core.autocrlf=true 还原成 CRLF。
+# 本工程源码现状是 UTF-8 带 BOM + CRLF —— autocrlf 只动行尾，不动 BOM，两者不冲突。
+
+# ── 文本 ──
+*.cs        text diff=csharp
+*.csproj    text
+*.sln       text
+*.config    text
+*.resx      text
+*.settings  text
+*.html      text
+*.md        text
+*.json      text
+
+# ── 二进制：显式声明，别让 autocrlf 靠启发式去猜 ──
+# 启发式是"文件里有没有 NUL 字节"，对 dll / pdb 通常判断正确。但猜错的代价很隐蔽：
+# 文件被当成文本做行尾规范化后，损坏是**不可见的**，要到某次编译或运行才炸，
+# 而那时已经提交进历史了。这类文件必须写死。
+*.dll       binary
+*.pdb       binary
+*.exe       binary
+*.ico       binary
+*.png       binary
