@@ -1,6 +1,7 @@
 ﻿using GerberParserTool;
 using Korey.SmartWindow.WinForms;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -22,6 +23,17 @@ namespace GerberParserSmartV4._0
         // 已载入的图层，顺序 = 加载顺序 = 绘制顺序（后加载的在上层）。
         // 这是多图层模型里的权威数据，_apertures 由它聚合而来。
         private List<LayerInfo> _layers = new List<LayerInfo>();
+
+        // 图层 Id → LayerInfo。Id 在图层首次进入 RefreshLayerState() 时分配，
+        // **置顶重排不会改变它** —— 图形的归属就是靠这个 Id 建立的。
+        //
+        // 为什么不拿"shape.Layer 与 layer.FileName"做字符串匹配来现查：
+        // 那种匹配一旦有一处对不上（老数据、命名差异、以后改命名规则）就会**静默失效**，
+        // 表现为"命中优先级退回纯距离排序"——也就是"怎么点都只选到最大的那个圆"，且无报错可查。
+        private readonly Dictionary<int, LayerInfo> _layerById = new Dictionary<int, LayerInfo>();
+
+        // 下一个可用的图层 Id（只增不减）。
+        private int _nextLayerId = 1;
 
         private GerberParser _parser = new GerberParser();
 
@@ -46,6 +58,26 @@ namespace GerberParserSmartV4._0
         private bool _isSingleClickMode = true;
         private bool _isTemplateMode = false;
 
+        // ── 选点划分：插针头类型 h1 / h2 / h3 ──
+        //
+        // 这是"当前用哪个头"的全局状态（对应 V5 右侧面板那个下拉框，本工程搬进了工具栏）。
+        // 左键选点 / 多选扩散 / 框选新增，都把当前值写进图形的 SelectedCircle.HeaderType。
+        //
+        // 为什么用"当前值 + 写进图形"，而不是"按下标分组存三份列表"：
+        // 一个点只属于一个头，挂在图形上就只有**一份真相** —— 绘制、保存、导出读的是同一个字段；
+        // 分成三份列表就要处处维护"这个点在哪个列表里"，改一次类型得跨列表搬移。
+        private string _currentHeaderType = "h1";
+
+        // 防递归：三个 h toggle 共享同一份状态，互相赋值会触发对方的 CheckedChanged（同 _syncingClickMode）
+        private bool _syncingHeader = false;
+
+        // ── 合并模式 ──
+        // 进入后左键点击不再"选点"，而是把图形选成**合并候选**；候选满两个 → 取中点生成一个新点。
+        // 候选是**独立于选中状态**的一份临时清单：合并期间不动 _selectedCircles，
+        // 用户随时退出合并模式，已有选点结果一个都不会变（见 HandleMergeClick 的注释）。
+        private bool _isMergeMode = false;
+        private readonly List<SelectedCircle> _mergeCandidates = new List<SelectedCircle>();
+
         // 「显示底图」开关。原来的真值存在右侧面板的两个 RadioButton 上（面板已删除），
         // 现在由本字段承载；画布悬浮工具栏的「底图」toggle、菜单「视图 → 显示底图」都指向它，
         // 三处入口统一走 SetShowBaseLayer()，不再各自赋值。
@@ -67,6 +99,9 @@ namespace GerberParserSmartV4._0
         {
             public SelectedCircle Shape;
             public bool WasSelected;
+
+            /// <summary>框选会把新选中的点归到"当前头类型"，所以撤销时这个也要一起回滚。</summary>
+            public string WasHeaderType;
         }
         private readonly List<List<SelectionSnapshot>> _regionUndoStack = new List<List<SelectionSnapshot>>();
         private const int RegionUndoDepth = 20;
@@ -80,8 +115,15 @@ namespace GerberParserSmartV4._0
         private string _currentTemplatePath = string.Empty;
         //首次加载标记
         private bool _firstLoadTag = false;
-        //选中颜色
+        // 选点颜色（来自「参数设置 → h1 颜色」）。默认白色。
+        // ⚠ 2026-09-21 起它只表示 **h1 那一档**的颜色：h2 / h3 各有自己的设置项（见下）。
+        //   这样老工程（所有点都是 h1）打开后的观感与改动前完全一致，参数设置里的这一项也仍然有效。
         private string _selectColor = Properties.Settings.Default.SelectedCircleColor; // 默认白色
+
+        // h2 / h3 的画布配色，同样可在「参数设置」里改（三个头各一行，与 V5 一致）。默认黄 / 绿。
+        // 取值时机：字段初始化器（启动读一次）→ 参数窗体确定后回写（见 btnParamSetting_Click）。
+        private string _headerH2Color = Properties.Settings.Default.HeaderH2Color;
+        private string _headerH3Color = Properties.Settings.Default.HeaderH3Color;
         // 翻转状态标记
         private bool _isMirroredX = false;
         private bool _isMirroredY = false;
@@ -99,6 +141,19 @@ namespace GerberParserSmartV4._0
             public ApertureShape Shape { get; set; } // 形状类型
             public bool IsSelected { get; set; }
 
+            /// <summary>
+            /// 该点由**哪个插针头**插：`"h1"` / `"h2"` / `"h3"`。空串或未知值一律按 h1 处理
+            /// （见 <see cref="NormalizeHeader"/>），所以老 circles.json 打开后行为与之前完全一致。
+            ///
+            /// ⚠ 它与 `Layer` 是**两个正交的维度**，别混：
+            ///   · `Layer`   = 这个图形来自哪个 Gerber 文件（几何归属，参与唯一键、决定命中优先级）；
+            ///   · `HeaderType` = 这个点要哪个插针头来插（工艺分配，不参与任何几何判定）。
+            /// 同一个图层上的点可以分属三个头，同一个头的点也可以散布在多个图层上。
+            ///
+            /// 它只影响两件事：① 画布上的颜色（见 <see cref="HeaderColorOf"/>）；② 导出的分组。
+            /// </summary>
+            public string HeaderType { get; set; } = "h1";
+
             // ── 多图层支持 ──
             /// <summary>
             /// 该图形所属的图层文件名（如 "1516601-00-C_01.GBL"）。空字符串 = 单图层 / 未知。
@@ -111,6 +166,27 @@ namespace GerberParserSmartV4._0
             /// 且三个带参构造都没有 `: this()` 链到无参构造，写在无参构造里必然漏。
             /// </summary>
             public string Layer { get; set; } = string.Empty;
+
+            // ── 图层状态的**运行期副本**（不持久化，不写进 circles.json）──
+            //
+            // 为什么把状态拷到每个图形上，而不是"拿 shape.Layer 去图层表里现查"：
+            // 现查要求两个字符串逐字符相等 —— 一旦对不上（老数据、命名差异、以后改了命名规则），
+            // 命中优先级与隐藏过滤会**静默失效**：代码看着改了，实际退回"纯按距离排序"，
+            // 表现就是"不论怎么点，还是只能选中最大的那个圆"。拷一份就没有这层脆弱匹配。
+            //
+            // 三个字段由 MainForm.RefreshLayerState() 统一刷新（载入工程 / 勾选显隐 / 图层置顶）。
+
+            /// <summary>所属图层的会话内 Id（见 <see cref="LayerInfo.Id"/>）。0 = 未知归属。</summary>
+            public int LayerId { get; set; } = 0;
+
+            /// <summary>
+            /// 所属图层在 _layers 里的序号：**数值越大越靠上层**。命中优先级比较的就是它。
+            /// -1 = 未知归属（当作最底层，但**仍可被点中**）。
+            /// </summary>
+            public int LayerDepth { get; set; } = -1;
+
+            /// <summary>所属图层当前是否被隐藏。隐藏的图形不画、不被点中、不进框选与多选扩散。</summary>
+            public bool LayerHidden { get; set; } = false;
 
             // Parameterless ctor required for JSON deserialization
             public SelectedCircle()
@@ -175,8 +251,23 @@ namespace GerberParserSmartV4._0
             public string FileName = string.Empty;
 
             /// <summary>
-            /// 是否显示。**只影响绘制**（该图层的图形与已选点都不画），
-            /// 不改变 _selectedCircles，也不影响导出结果 —— 见 README 规则 R1。
+            /// 会话内唯一 Id，首次载入时由 <see cref="RefreshLayerState"/> 分配，**此后不再变化**。
+            /// 图形的归属靠它建立：置顶只改变图层序号，不会改变 Id ——
+            /// 若拿序号当身份，一次重排之后"图形属于哪层"就全错了。
+            /// </summary>
+            public int Id = 0;
+
+            /// <summary>
+            /// 配色序号：载入时按当时的位置分配，**不随置顶重排而变**。
+            /// 否则用户一点「置顶」，那层的颜色就跟着序号跳到另一个颜色，看着像 bug。
+            /// -1 = 尚未分配。
+            /// </summary>
+            public int ColorIndex = -1;
+
+            /// <summary>
+            /// 是否显示。三条语义（详见交接文档第五节第 11 条）：
+            /// ① **不画**（该图层的底图与已选点都不画）；② **不选**（点不中 / 框选不到 / 多选不扩散）；
+            /// ③ **数据保留**（不动 _selectedCircles，重新勾上原样回来）。
             /// </summary>
             public bool IsVisible = true;
 
@@ -185,19 +276,93 @@ namespace GerberParserSmartV4._0
         }
 
         /// <summary>
-        /// 图层容器里的一行：左边文件名，右边一个复选框。
+        /// 图层容器里的一行：左边文件名，中间一个「置顶」按钮，右边一个复选框。
+        /// 三个区域横向排开，点击按坐标分流（复选框右侧、置顶按钮中右、其余整行左侧）。
         ///
         /// 为什么自绘而不用 CheckBox / Button：WinForms 里这两个都**不支持透明背景**
         /// （CheckBox 同样没声明 SupportsTransparentBackColor），直接放在黑画布上会是一块不透明的方块。
         /// 做法完全照搬控件库的 OverlayToolbarButton：Control 自绘 + SupportsTransparentBackColor，
         /// OnPaintBackground 只调 base 让父控件（半透明容器 → 画布）先画，本层不叠加任何底色。
         /// </summary>
+        /// <summary>
+        /// 图层容器的**列几何**。容器里有两类行控件（顶部栏 / 图层行），它们的列位置必须**逐像素一致**，
+        /// 否则表头与内容会错开一格（"置顶"两个字压在 ↑ 图标左边或右边）。几何只写一处，两边都调这里。
+        ///
+        /// 三列自右向左定：复选框 → 置顶列 → 文字区（文字区吃掉剩下的全部宽度）。
+        ///
+        /// ⚠ 「置顶」列的宽度是**量出来的**、不是写死的 24：顶部栏要在这一列里画出「置顶」两个字，
+        /// 而原来只为 ↑ 图标留了 24px，`SystemFonts.DefaultFont` 下两个汉字约 22~26px ——
+        /// 写死就会让表头文字被裁掉或溢到复选框上，还会连带把下面每行的文字区宽度算计错。
+        /// </summary>
+        private static class LayerRowLayout
+        {
+            /// <summary>复选框边长（像素）。</summary>
+            public const int BoxSize = 12;
+
+            /// <summary>↑ 图标所需的最小列宽 —— 无论文字多窄都不小于它。</summary>
+            private const int TopIconMinWidth = 24;
+
+            private static readonly int _topColumnWidth = MeasureTopColumnWidth();
+
+            /// <summary>「置顶」列宽 = max(图标所需 24, 「置顶」文字宽 + 6)。</summary>
+            public static int TopColumnWidth { get { return _topColumnWidth; } }
+
+            private static int MeasureTopColumnWidth()
+            {
+                return Math.Max(TopIconMinWidth, TextWidth("置顶") + 6);
+            }
+
+            /// <summary>量一段文字的像素宽（与绘制同字体、同 flags，避免量出来的和画出来的对不上）。</summary>
+            public static int TextWidth(string text)
+            {
+                if (string.IsNullOrEmpty(text)) return 0;
+                Size t = TextRenderer.MeasureText(text, SystemFonts.DefaultFont,
+                                                  new Size(int.MaxValue, int.MaxValue),
+                                                  TextFormatFlags.NoPadding);
+                return t.Width;
+            }
+
+            /// <summary>
+            /// 行宽 = 左右留白 + 文字 + 间隔 + **置顶列占位** + 间隔 + 复选框。
+            /// 置顶列对**所有行**都算进去（最上层那行只是不画 ↑ 图标）—— 否则它短一截，
+            /// 复选框就会跟别的行错开一格。各行之间还会再统一取最大值，见 RefreshLayerPanel。
+            /// </summary>
+            public static int RowWidth(string text)
+            {
+                int textWidth = TextWidth(string.IsNullOrEmpty(text) ? "M" : text);
+                return KWindowOptions.ToolbarButtonPaddingX * 2
+                     + textWidth + 8
+                     + TopColumnWidth + 8
+                     + BoxSize;
+            }
+
+            /// <summary>置顶列（贴复选框左侧）。</summary>
+            public static Rectangle TopColumn(int width, int height)
+            {
+                int right = width - BoxSize - KWindowOptions.ToolbarButtonPaddingX - 8;
+                return new Rectangle(right - TopColumnWidth, 0, TopColumnWidth, height);
+            }
+
+            /// <summary>复选框（贴右）。宽高比边长小 1，是原来就有的写法（给描边留出半个像素）。</summary>
+            public static Rectangle CheckBox(int width, int height)
+            {
+                int boxX = width - BoxSize - KWindowOptions.ToolbarButtonPaddingX;
+                return new Rectangle(boxX, (height - BoxSize) / 2, BoxSize - 1, BoxSize - 1);
+            }
+
+            /// <summary>文字区宽度（左对齐，吃掉剩下的全部宽度）。</summary>
+            public static int TextAreaWidth(int width)
+            {
+                return width - BoxSize - KWindowOptions.ToolbarButtonPaddingX * 2 - 8 - (TopColumnWidth + 8);
+            }
+        }
+
         private sealed class LayerRowControl : Control
         {
-            private const int BoxSize = 12;      // 复选框边长（像素）
-
             private bool _hover;
+            private bool _hoverTopButton;            // 光标是否停在置顶按钮上
             private bool _checked;
+            private bool _isTopLayer;                // 已经在最上层：不画置顶按钮（点了也没用）
 
             /// <summary>这一行对应 _layers 里的序号。跟着图层走，不跟着行号走。</summary>
             public int LayerIndex = -1;
@@ -205,7 +370,10 @@ namespace GerberParserSmartV4._0
             /// <summary>勾选变化：(图层序号, 是否可见)。由宿主转发给 SetLayerVisible。</summary>
             public event Action<int, bool> VisibilityChanged;
 
-            public LayerRowControl(string fileName, bool isVisible, int layerIndex)
+            /// <summary>点了「置顶」：(图层序号)。宿主把它移到最上层、并让容器重排。</summary>
+            public event Action<int> TopRequested;
+
+            public LayerRowControl(string fileName, bool isVisible, int layerIndex, bool isTopLayer)
             {
                 SetStyle(ControlStyles.UserPaint
                        | ControlStyles.AllPaintingInWmPaint
@@ -220,10 +388,11 @@ namespace GerberParserSmartV4._0
 
                 LayerIndex = layerIndex;
                 _checked = isVisible;
+                _isTopLayer = isTopLayer;
                 Text = fileName;
 
                 Height = KWindowOptions.ToolbarButtonHeight;
-                Width = MeasureRowWidth(fileName);
+                Width = MeasureRowWidth(fileName);   // 先按自身文字宽；RefreshLayerPanel 会统一成同一宽度
             }
 
             public bool Checked
@@ -238,24 +407,63 @@ namespace GerberParserSmartV4._0
                 }
             }
 
-            /// <summary>行宽 = 左右留白 + 文字 + 与复选框的间隔 + 复选框。</summary>
-            private static int MeasureRowWidth(string text)
+            /// <summary>行宽（几何在 LayerRowLayout，顶部栏与图层行共用同一份）。</summary>
+            public static int MeasureRowWidth(string text)
             {
-                Size t = TextRenderer.MeasureText(string.IsNullOrEmpty(text) ? "M" : text,
-                                                  SystemFonts.DefaultFont,
-                                                  new Size(int.MaxValue, int.MaxValue),
-                                                  TextFormatFlags.NoPadding);
-                return KWindowOptions.ToolbarButtonPaddingX * 2 + t.Width + 8 + BoxSize;
+                return LayerRowLayout.RowWidth(text);
             }
 
             protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
 
-            protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
-
-            protected override void OnClick(EventArgs e)
+            protected override void OnMouseLeave(EventArgs e)
             {
-                Checked = !Checked;      // 触发 VisibilityChanged
-                base.OnClick(e);
+                _hover = false;
+                _hoverTopButton = false;
+                Invalidate();
+                base.OnMouseLeave(e);
+            }
+
+            /// <summary>置顶按钮占据的横向区间（贴在复选框左边）。</summary>
+            private Rectangle TopButtonRect()
+            {
+                return LayerRowLayout.TopColumn(Width, Height);
+            }
+
+            private bool IsInTopButton(int x, int y)
+            {
+                if (_isTopLayer) return false;   // 已经在最上层：整个行都是"切换显隐"
+                return TopButtonRect().Contains(x, y);
+            }
+
+            protected override void OnMouseMove(MouseEventArgs e)
+            {
+                bool over = IsInTopButton(e.X, e.Y);
+                if (over != _hoverTopButton)
+                {
+                    _hoverTopButton = over;
+                    Invalidate();
+                }
+                base.OnMouseMove(e);
+            }
+
+            /// <summary>
+            /// 按下即响应（不走 Click）：一行里有两个可点区域，必须按**坐标**分流。
+            /// Click 事件在 MouseUp 时触发、拿不到可靠的分区语义，容易把"点置顶"误判成"切换显隐"。
+            /// </summary>
+            protected override void OnMouseDown(MouseEventArgs e)
+            {
+                if (e.Button == MouseButtons.Left)
+                {
+                    if (IsInTopButton(e.X, e.Y))
+                    {
+                        if (TopRequested != null) TopRequested(LayerIndex);
+                    }
+                    else
+                    {
+                        Checked = !Checked;      // 触发 VisibilityChanged
+                    }
+                }
+                base.OnMouseDown(e);
             }
 
             protected override void OnPaint(PaintEventArgs e)
@@ -271,20 +479,56 @@ namespace GerberParserSmartV4._0
 
                 Color fore = Enabled ? ForeColor : Color.FromArgb(120, ForeColor);
 
+                // 置顶按钮（贴复选框左侧）。**已经在最上层就不画**（点了没作用，画出来只会误导），
+                // 但它的位置照留 —— 所有行的文字区宽度必须一致，复选框才能纵向对齐。
+                if (!_isTopLayer)
+                {
+                    Rectangle btn = TopButtonRect();
+                    if (_hoverTopButton)
+                    {
+                        Color hover = KWindowOptions.ToolbarButtonHoverColor;
+                        if (hover.A > 0)
+                        {
+                            using (var brush = new SolidBrush(hover)) e.Graphics.FillRectangle(brush, btn);
+                        }
+                    }
+
+                    // 图标：向上箭头（实心三角头 + 短箭杆）。
+                    // 用几何自绘而不是"↑"字符或图标字体 —— 不赌系统里装了哪个字形，
+                    // 也不受 DPI 缩放影响（字符在某些字体下会缺字或大小对不上）。
+                    float cx = btn.Left + btn.Width / 2f;
+                    float cy = btn.Top + btn.Height / 2f;
+
+                    using (var brush = new SolidBrush(fore))
+                    using (var pen = new Pen(fore, 1.6f))
+                    {
+                        // 箭杆
+                        e.Graphics.DrawLine(pen, cx, cy - 1f, cx, cy + 5f);
+
+                        // 三角头（顶点朝上）
+                        e.Graphics.FillPolygon(brush, new[]
+                        {
+                            new PointF(cx, cy - 6f),
+                            new PointF(cx - 4.5f, cy),
+                            new PointF(cx + 4.5f, cy)
+                        });
+                    }
+                }
+
                 // 文字（左），绘制与测量统一用 SystemFonts.DefaultFont，避免测量的宽度和实际画出来的对不上
                 var textRect = new Rectangle(
                     KWindowOptions.ToolbarButtonPaddingX,
                     0,
-                    Width - BoxSize - KWindowOptions.ToolbarButtonPaddingX * 2 - 8,
+                    LayerRowLayout.TextAreaWidth(Width),
                     Height);
                 TextRenderer.DrawText(e.Graphics, Text, SystemFonts.DefaultFont, textRect, fore,
                                       TextFormatFlags.Left | TextFormatFlags.VerticalCenter
                                     | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
 
                 // 复选框（右）
-                int boxX = Width - BoxSize - KWindowOptions.ToolbarButtonPaddingX;
-                int boxY = (Height - BoxSize) / 2;
-                var box = new Rectangle(boxX, boxY, BoxSize - 1, BoxSize - 1);
+                Rectangle box = LayerRowLayout.CheckBox(Width, Height);
+                int boxX = box.Left;
+                int boxY = box.Top;
 
                 using (var pen = new Pen(fore, 1f))
                 {
@@ -298,10 +542,168 @@ namespace GerberParserSmartV4._0
                     {
                         e.Graphics.DrawLines(pen, new[]
                         {
-                            new Point(boxX + 2, boxY + BoxSize / 2 - 1),
-                            new Point(boxX + BoxSize / 2 - 1, boxY + BoxSize - 4),
-                            new Point(boxX + BoxSize - 3, boxY + 2)
+                            new Point(boxX + 2, boxY + LayerRowLayout.BoxSize / 2 - 1),
+                            new Point(boxX + LayerRowLayout.BoxSize / 2 - 1, boxY + LayerRowLayout.BoxSize - 4),
+                            new Point(boxX + LayerRowLayout.BoxSize - 3, boxY + 2)
                         });
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 图层容器的**顶部栏**（表头行）：三段与下面每一行**逐列对齐** ——
+        /// 左「文件名」、中「置顶」、右一个方框。
+        /// 前两段是**纯文字**（列名，不响应点击），只有右边的方框是可点的：全选 / 取消全选。
+        ///
+        /// 【为什么只让方框可点，不是整行可点】
+        /// 整行可点意味着"想看清表头"的一次误触会把**所有图层一起隐藏**。按规则 R1 数据当然还在、
+        /// 重新勾上就全回来，但用户的第一反应会是"我的图层全没了"—— 可点的东西就该长得像可点的东西。
+        /// 所以热区只在方框周围（12px 的框再外扩 6px，够手指点又不至于误触）。
+        ///
+        /// 【方框是三态的】全勾 → 打勾；部分勾 → 一横（半选）；全不勾 → 空。
+        /// 半选态**只影响显示**，点击行为始终只有两条：**全勾时点 = 全部取消；其余（含半勾）点 = 全部勾上**。
+        /// 这样"想看全部 → 点一下"永远成立，用户不必先数现在勾了几个。
+        ///
+        /// 自绘的理由与 LayerRowControl 相同：CheckBox 不支持透明背景，放在黑画布上会是一块不透明方块。
+        /// </summary>
+        private sealed class LayerHeaderControl : Control
+        {
+            /// <summary>方框外扩的热区半宽（像素）。</summary>
+            private const int HitPadding = 6;
+
+            private bool _hoverBox;
+            private bool _allChecked;      // 全部图层可见 → 打勾
+            private bool _anyChecked;      // 有任一可见 → 半选
+
+            /// <summary>点了方框。参数是**目标状态**（true = 全部显示）。</summary>
+            public event Action<bool> SelectAllRequested;
+
+            public LayerHeaderControl(bool allChecked, bool anyChecked)
+            {
+                SetStyle(ControlStyles.UserPaint
+                       | ControlStyles.AllPaintingInWmPaint
+                       | ControlStyles.OptimizedDoubleBuffer
+                       | ControlStyles.SupportsTransparentBackColor
+                       | ControlStyles.ResizeRedraw, true);
+
+                BackColor = Color.Transparent;
+                ForeColor = KWindowOptions.ToolbarButtonForeColor;
+                // 光标**不**整行设成手型：本行只有右边的方框可点，
+                // 整行手型会暗示"点哪里都行"，点上去却没反应 —— 与"可点的东西长得像可点的"相反。
+                // 所以改在 OnMouseMove 里按热区切换。
+                Cursor = Cursors.Default;
+                TabStop = false;
+
+                _allChecked = allChecked;
+                _anyChecked = anyChecked;
+
+                Height = KWindowOptions.ToolbarButtonHeight;
+                Width = LayerRowLayout.RowWidth("文件名");   // RefreshLayerPanel 会统一成同一宽度
+            }
+
+            private Rectangle BoxHitRect()
+            {
+                return Rectangle.Inflate(LayerRowLayout.CheckBox(Width, Height), HitPadding, HitPadding);
+            }
+
+            protected override void OnMouseEnter(EventArgs e) { Invalidate(); base.OnMouseEnter(e); }
+
+            protected override void OnMouseLeave(EventArgs e)
+            {
+                _hoverBox = false;
+                Cursor = Cursors.Default;
+                Invalidate();
+                base.OnMouseLeave(e);
+            }
+
+            protected override void OnMouseMove(MouseEventArgs e)
+            {
+                bool over = BoxHitRect().Contains(e.X, e.Y);
+                Cursor = over ? Cursors.Hand : Cursors.Default;   // 手型只出现在真能点的那块
+                if (over != _hoverBox)
+                {
+                    _hoverBox = over;
+                    Invalidate();
+                }
+                base.OnMouseMove(e);
+            }
+
+            /// <summary>
+            /// 按下即响应（与图层行一致，不走 Click）：本行的"可点区域"只有右边一小块，
+            /// 按坐标判定比 MouseUp 的 Click 语义可靠。
+            /// </summary>
+            protected override void OnMouseDown(MouseEventArgs e)
+            {
+                if (e.Button == MouseButtons.Left && BoxHitRect().Contains(e.X, e.Y))
+                {
+                    // 全勾 → 全部取消；只要不是全勾（含半勾）→ 全部勾上。
+                    if (SelectAllRequested != null) SelectAllRequested(!_allChecked);
+                }
+                base.OnMouseDown(e);
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                // 表头文字比图层名**淡一档**：它只是列名，不该和下面的内容抢注意力。
+                Color fore = Color.FromArgb((int)(ForeColor.A * 0.72f), ForeColor);
+                if (!Enabled) fore = Color.FromArgb(110, fore);
+
+                // 左：「文件名」（与下面每行的图层名左对齐）
+                var textRect = new Rectangle(KWindowOptions.ToolbarButtonPaddingX, 0,
+                                             LayerRowLayout.TextAreaWidth(Width), Height);
+                TextRenderer.DrawText(e.Graphics, "文件名", SystemFonts.DefaultFont, textRect, fore,
+                                      TextFormatFlags.Left | TextFormatFlags.VerticalCenter
+                                    | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+
+                // 中：「置顶」（占位 = 下面每行的 ↑ 图标那一列，居中）
+                Rectangle column = LayerRowLayout.TopColumn(Width, Height);
+                TextRenderer.DrawText(e.Graphics, "置顶", SystemFonts.DefaultFont, column, fore,
+                                      TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter
+                                    | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+
+                // 右：全选方框
+                Rectangle box = LayerRowLayout.CheckBox(Width, Height);
+
+                if (_hoverBox)
+                {
+                    Color hover = KWindowOptions.ToolbarButtonHoverColor;
+                    if (hover.A > 0)
+                    {
+                        using (var brush = new SolidBrush(hover))
+                        {
+                            // 只高亮方框四周一小圈，不铺满整个热区 —— 铺满会像个按钮，与"复选框"的印象冲突
+                            e.Graphics.FillRectangle(brush, Rectangle.Inflate(box, 3, 3));
+                        }
+                    }
+                }
+
+                Color boxColor = Enabled ? Color.FromArgb((int)(ForeColor.A * 0.9f), ForeColor) : fore;
+                using (var pen = new Pen(boxColor, 1f))
+                {
+                    e.Graphics.DrawRectangle(pen, box);
+                }
+
+                if (_allChecked)
+                {
+                    // 勾：两笔折线（与图层行完全相同的画法）
+                    using (var pen = new Pen(fore, 1.6f))
+                    {
+                        e.Graphics.DrawLines(pen, new[]
+                        {
+                            new Point(box.Left + 2, box.Top + LayerRowLayout.BoxSize / 2 - 1),
+                            new Point(box.Left + LayerRowLayout.BoxSize / 2 - 1, box.Top + LayerRowLayout.BoxSize - 4),
+                            new Point(box.Left + LayerRowLayout.BoxSize - 3, box.Top + 2)
+                        });
+                    }
+                }
+                else if (_anyChecked)
+                {
+                    // 半选：一横。表示"只显示了一部分图层"—— 比画成空框诚实。
+                    using (var pen = new Pen(fore, 1.6f))
+                    {
+                        int y = box.Top + LayerRowLayout.BoxSize / 2;
+                        e.Graphics.DrawLine(pen, box.Left + 2, y, box.Left + LayerRowLayout.BoxSize - 3, y);
                     }
                 }
             }
@@ -353,12 +755,19 @@ namespace GerberParserSmartV4._0
             // 右键"未拖动"时弹上下文菜单（拖动则是平移，控件用 3px 位移阈值区分）
             kWindowControl1.ContextMenuRequested += KWindowControl_ContextMenuRequested;
 
+            // 拖放：把 Gerber / 钻孔文件直接拖进窗口。
+            // 窗体与画布**都要挂** —— 鼠标落点几乎总在画布上，只设窗体会收不到消息。
+            // 两处用同一个处理函数，所以拖到工具栏 / 状态栏 / 路径栏也同样生效。
+            this.AllowDrop = true;
+            this.DragEnter += OnFileDragEnter;
+            this.DragDrop += OnFileDragDrop;
+            kWindowControl1.AllowDrop = true;
+            kWindowControl1.DragEnter += OnFileDragEnter;
+            kWindowControl1.DragDrop += OnFileDragDrop;
+
             this.StartPosition = FormStartPosition.Manual;
 
             UpdateScaleLabel();
-
-            // 加载保存的路径
-            LoadSavedPath();
         }
 
         private void OnViewChanged(object sender, EventArgs e)
@@ -370,6 +779,10 @@ namespace GerberParserSmartV4._0
 
         private void MainForm_Load(object sender, EventArgs e)
         {
+            // 默认工作路径现在**有默认值**（程序目录下的 Broad）—— 启动时保证它存在，
+            // 否则"新建工程载入完自动落盘"那一步会因为目录不存在而退化成弹框问位置。
+            EnsureDefaultProjectRoot();
+
             // 悬浮工具栏与图层容器都是运行时 new 出来再挂上去的（按钮按行按需生成，设计器无法序列化），
             // 所以必须在这里、控件创建之后构建。
             BuildOverlayToolbar();
@@ -462,10 +875,20 @@ namespace GerberParserSmartV4._0
         private OverlayToolbarButton _btnMultiMode;
         private OverlayToolbarButton _btnShowBaseLayer;
 
+        // 插针头类型（h1/h2/h3）与合并模式 —— 都是工具栏上的 toggle
+        private OverlayToolbarButton _btnHeaderH1;
+        private OverlayToolbarButton _btnHeaderH2;
+        private OverlayToolbarButton _btnHeaderH3;
+        private OverlayToolbarButton _btnMerge;
+
         // 画布右上角的图层容器（纵列表：每行 = 文件名 + 复选框）。
         // 它**不是**用 AttachOverlayToolbar 挂的 —— 那个 API 是单浮层，会把上面这条工具栏顶掉。
         // 详见 BuildLayerPanel() 的注释。
         private OverlayToolbar _layerPanel;
+
+        // 图层行的悬停提示。置顶按钮现在只有一个箭头图标、没有文字，
+        // 第一次用的人猜不出它是干什么的 —— 用 ToolTip 补上说明（整行一条，覆盖两种操作）。
+        private ToolTip _layerRowToolTip;
 
         // 防递归：toggle 与「底图显示」的 RadioButton 共享同一份状态，互相赋值会触发对方的
         // CheckedChanged。不加这个标志会形成"点 A 设 B、B 的回调又把 A 设回来"的回环。
@@ -489,13 +912,30 @@ namespace GerberParserSmartV4._0
 
             _overlayToolbar.AddSeparator();
 
-            // ② 框选与限定
+            // ② 插针头类型：h1 / h2 / h3（互斥的三个 toggle）——
+            //    决定"接下来选中的点归哪个头"，与「单选 / 多选」同构：都是"当前用哪种语义"的开关。
+            //    按钮上只写 h1/h2/h3，与状态栏、右键菜单显示的名字一致（颜色见 HeaderColorOf）。
+            _btnHeaderH1 = _overlayToolbar.AddToggleButton("h1", true, (s, e) => SetCurrentHeader("h1"));
+            _btnHeaderH2 = _overlayToolbar.AddToggleButton("h2", false, (s, e) => SetCurrentHeader("h2"));
+            _btnHeaderH3 = _overlayToolbar.AddToggleButton("h3", false, (s, e) => SetCurrentHeader("h3"));
+
+            _overlayToolbar.AddSeparator();
+
+            // ③ 合并（互斥无关，单纯是"进入 / 退出合并模式"的开关）
+            _btnMerge = _overlayToolbar.AddToggleButton("合并", false, (s, e) =>
+            {
+                SetMergeMode(_btnMerge.Checked);
+            });
+
+            _overlayToolbar.AddSeparator();
+
+            // ④ 框选与限定
             _overlayToolbar.AddButton("框选区域 (Q)", (s, e) => StartRegionSelectingMode());
             _overlayToolbar.AddButton("解除限定", (s, e) => ReleaseRegionScope());
 
             _overlayToolbar.AddSeparator();
 
-            // ③ 清空与底图
+            // ⑤ 清空与底图
             _overlayToolbar.AddButton("清空选点", (s, e) => ClearAllSelectedPoints());
             _btnShowBaseLayer = _overlayToolbar.AddToggleButton("底图", _showBaseLayer, (s, e) =>
             {
@@ -533,6 +973,14 @@ namespace GerberParserSmartV4._0
             _layerPanel.AutoSizeMode = AutoSizeMode.GrowAndShrink;
             _layerPanel.Visible = false;                         // 没有工程时不显示
 
+            // 行的悬停提示。创建一次即可，行是反复重建的，SetToolTip 会覆盖旧关联。
+            _layerRowToolTip = new ToolTip
+            {
+                InitialDelay = 400,
+                ReshowDelay = 200,
+                AutoPopDelay = 6000
+            };
+
             kWindowControl1.Controls.Add(_layerPanel);
             kWindowControl1.Resize += (s, e) => RepositionLayerPanel();
 
@@ -542,6 +990,10 @@ namespace GerberParserSmartV4._0
         /// <summary>按当前 _layers 重建容器内容。工程载入后调用。</summary>
         private void RefreshLayerPanel()
         {
+            // 先重算图层状态（叠放深度 + 隐藏），且必须在下面那个"没有容器就返回"的早退**之前** ——
+            // 状态是命中测试与选点绘制的依据，跟容器在不在没有关系。
+            RefreshLayerState();
+
             if (_layerPanel == null || _layerPanel.IsDisposed) return;
 
             _layerPanel.SuspendLayout();
@@ -561,12 +1013,72 @@ namespace GerberParserSmartV4._0
                     return;
                 }
 
+                // 统一行宽（取最长的一行）：行宽若各随自己的文字长度变，同一列的复选框就会左右参差。
+                // 顶部栏也要一起算进来 —— 它是首行，比任何一行窄都会让整列错位。
+                int maxRowWidth = LayerRowControl.MeasureRowWidth("文件名");
                 for (int i = 0; i < _layers.Count; i++)
                 {
+                    if (_layers[i] == null) continue;
+                    maxRowWidth = Math.Max(maxRowWidth, LayerRowControl.MeasureRowWidth(_layers[i].FileName));
+                }
+
+                // ① 顶部栏（表头）：文件名 | 置顶 | 【全选】。**必须最先加** ——
+                //    TopDown 流式布局里"先加的在上面"，它就是列表的首行。
+                // 它的方框是三态的，所以要先把"全可见 / 有可见"这两个统计算出来喂给它。
+                bool allVisible = true;
+                bool anyVisible = false;
+                for (int i = 0; i < _layers.Count; i++)
+                {
+                    if (_layers[i] == null) continue;
+                    if (_layers[i].IsVisible) anyVisible = true;
+                    else allVisible = false;
+                }
+
+                var header = new LayerHeaderControl(allVisible, anyVisible)
+                {
+                    Width = maxRowWidth
+                };
+                header.SelectAllRequested += OnLayerHeaderSelectAllRequested;
+                _layerPanel.Controls.Add(header);
+
+                if (_layerRowToolTip != null)
+                {
+                    _layerRowToolTip.SetToolTip(header,
+                        "文件名 / 置顶 是列名，点它们没有作用\r\n" +
+                        "点最右边那个方框：显示全部图层 / 隐藏全部图层\r\n" +
+                        "（隐藏只是不画、不选，选点数据仍然保留，重新全选就回来）");
+                }
+
+                // ⚠ **倒序**填充：列表第一行 = _layers 的最后一项 = 画在**最上层**的那层。
+                //    这样容器里的上下顺序与画面上的叠放顺序一致 —— 原来两者正好相反
+                //    （首行是最先加载、画在最底下的那个），用户得在脑子里翻一次才算得对，
+                //    「置顶」按钮的语义（点了就排到首行 = 压在最上面）也就无从谈起。
+                for (int i = _layers.Count - 1; i >= 0; i--)
+                {
                     LayerInfo layer = _layers[i];
-                    var row = new LayerRowControl(layer.FileName, layer.IsVisible, i);
+
+                    // isTopLayer：已经在最上层的那行不画「置顶」按钮（点了没作用，画出来只会误导）
+                    var row = new LayerRowControl(layer.FileName, layer.IsVisible, i, i == _layers.Count - 1)
+                    {
+                        Width = maxRowWidth
+                    };
                     row.VisibilityChanged += OnLayerRowVisibilityChanged;
+                    row.TopRequested += OnLayerRowTopRequested;
                     _layerPanel.Controls.Add(row);
+
+                    if (_layerRowToolTip != null)
+                    {
+                        string tip = layer.FileName + "\r\n点这一行：显示 / 隐藏该图层";
+                        if (i != _layers.Count - 1)
+                        {
+                            tip += "\r\n点 ↑ 图标：移到最上层（压在所有图层之上，并排到列表首行）";
+                        }
+                        else
+                        {
+                            tip += "\r\n（已是最上层）";
+                        }
+                        _layerRowToolTip.SetToolTip(row, tip);
+                    }
                 }
 
                 _layerPanel.Visible = true;
@@ -599,8 +1111,53 @@ namespace GerberParserSmartV4._0
             _layers[layerIndex].IsVisible = visible;
             KLog.Info($"图层显隐：{_layers[layerIndex].FileName} = {visible}");
 
-            // 规则 R1：可见性只影响绘制 —— 不碰 _selectedCircles，也不碰 _apertures（包围盒因此不会跳）
+            // 显隐变了必须立刻把状态刷进图形 —— 否则会出现"图层刚隐藏，它的选点还画着、还能点中"的滞后。
+            RefreshLayerState();
+
+            // 规则 R1：可见性只影响**呈现与可点性** —— 不碰 _selectedCircles，也不碰 _apertures。
+            // 于是：隐藏图层的选点不再绘制、不再能被点中 / 框选，但**数据仍留在集合里**，
+            // 重新勾上就原样回来（隐藏是临时的视觉操作，不该顺手删掉用户选的 3852 个点）。
+            // 包围盒因此也不会跳 —— 它按 _apertures 算，不受显隐影响。
             RefreshKWindow();
+        }
+
+        /// <summary>
+        /// 容器**顶部栏的方框**被点：把所有图层一次性设为可见 / 不可见（全选 / 取消全选）。
+        ///
+        /// 语义与单行切换（OnLayerRowVisibilityChanged）**完全一致**（规则 R1）：只改
+        /// `LayerInfo.IsVisible`，**不碰 `_selectedCircles` / `_apertures`** ——
+        /// 隐藏期间选点数据原样留着，重新全选就全部回来，包围盒也不会跳。
+        ///
+        /// 【为什么这里必须重建容器，而单行切换只需刷新】
+        /// 每一行自己的复选框是**该行控件的私有状态**（`LayerRowControl._checked`），
+        /// 全选改了所有图层，就必须让所有行的方框跟着变 —— 唯一同步手段是重建（RefreshLayerPanel）。
+        /// 单行切换时被点的那一行已经是最新的，所以它只调 RefreshLayerState + RefreshKWindow，
+        /// 不重建（重建会顺手把鼠标下的悬停态清掉，手感变差）。
+        /// </summary>
+        private void SetAllLayersVisible(bool visible)
+        {
+            if (_layers.Count == 0) return;
+
+            for (int i = 0; i < _layers.Count; i++)
+            {
+                if (_layers[i] != null) _layers[i].IsVisible = visible;
+            }
+
+            KLog.Info($"图层显隐（全选）：{_layers.Count} 个图层 = {visible}");
+            LogLayerOrder();     // 顺带把层序与显隐打进日志，方便回看这一下到底改了什么
+
+            RefreshLayerPanel(); // 内部先 RefreshLayerState()，再重建顶部栏与全部行
+            RefreshKWindow();
+
+            toolStripStatusLabel1.Text = visible
+                ? $"已显示全部图层（共 {_layers.Count} 个）"
+                : $"已隐藏全部图层（共 {_layers.Count} 个，选点数据保留，点方框即可恢复）";
+        }
+
+        /// <summary>容器顶部栏的方框被点。参数 = 目标状态（true 表示"全部显示"）。</summary>
+        private void OnLayerHeaderSelectAllRequested(bool visible)
+        {
+            SetAllLayersVisible(visible);
         }
 
         /// <summary>
@@ -621,6 +1178,153 @@ namespace GerberParserSmartV4._0
             finally { _syncingClickMode = false; }
 
             UpdateSelectionStatusText();
+        }
+
+        /// <summary>
+        /// 切换"当前插针头类型"（h1 / h2 / h3）。工具栏三个 toggle、右键菜单三项共用这一个入口。
+        ///
+        /// 它只决定"**接下来**选中的点归哪个头"，**不动已经选好的点** —— 用户切到 h2 是为了接着选 h2 的点，
+        /// 不是要把刚才那批 h1 一起改掉。要改已有点的类型：在目标 h 下重新点它一下（选中会写入当前值），
+        /// 或者用框选把一片重新框进来（框选同样写当前值，且可以用 Ctrl+Z 撤销 —— 见 ApplyRegionSelection）。
+        ///
+        /// 防递归的理由与 SetClickMode 完全相同：给 toggle 赋 Checked 会触发它自己的 CheckedChanged。
+        /// </summary>
+        private void SetCurrentHeader(string header)
+        {
+            string h = NormalizeHeader(header);
+
+            if (_syncingHeader) return;
+            _syncingHeader = true;
+            try
+            {
+                _currentHeaderType = h;
+                if (_btnHeaderH1 != null) _btnHeaderH1.Checked = (h == "h1");
+                if (_btnHeaderH2 != null) _btnHeaderH2.Checked = (h == "h2");
+                if (_btnHeaderH3 != null) _btnHeaderH3.Checked = (h == "h3");
+            }
+            finally { _syncingHeader = false; }
+
+            KLog.Info($"切换插针头类型：{h}");
+            UpdateSelectionStatusText($"已切换到 {h}（接下来选中的点归 {h}）");
+        }
+
+        /// <summary>
+        /// 进入 / 退出**合并模式**。
+        ///
+        /// 合并的语义（照 V5，保证两个版本的操作习惯一致）：
+        ///   进入后在画布上依次点**两个**图形 → 取两者的**中点**、形状与尺寸沿用**第一个**，
+        ///   生成一个新选点（归当前 h 类型）；**原来那两个点保留不动**。
+        ///
+        /// 为什么候选清单独立于 _selectedCircles：合并是"看一眼再决定"的动作，
+        /// 若点一下就顺手把图形选中了，用户一旦退出合并模式还得自己把那两个点取消掉 ——
+        /// 而"我只点了一下，选点数量就变了"正是本工程最忌讳的那种惊喜（同 R1 的取舍）。
+        /// </summary>
+        private void SetMergeMode(bool on)
+        {
+            _isMergeMode = on;
+            _mergeCandidates.Clear();
+
+            if (_btnMerge != null) _btnMerge.Checked = on;
+
+            KLog.Info(on ? "进入合并模式" : "退出合并模式");
+            RefreshKWindow();
+            UpdateSelectionStatusText(on
+                ? "合并模式：请依次点两个图形（取中点合成一个新点，原点保留；再点「合并」退出）"
+                : "已退出合并模式");
+        }
+
+        /// <summary>
+        /// 合并模式下的一次点击：把图形收进**合并候选**；候选满两个就合成一个新点。
+        ///
+        /// 两种"取消"都支持：① 再点一次已选为候选的那个图形 → 取消它的候选资格；
+        /// ② 点工具栏「合并」退出 → 候选清单清空，画面立刻还原，选点数据一点没动。
+        /// </summary>
+        private void HandleMergeClick(SelectedCircle clicked)
+        {
+            if (clicked == null) return;
+
+            // 再点同一个 = 取消候选（沿用"点一下选中、再点一下取消"的手感）
+            if (_mergeCandidates.Remove(clicked))
+            {
+                RefreshKWindow();
+                UpdateSelectionStatusText($"合并模式：已取消 1 个候选，当前 {_mergeCandidates.Count}/2");
+                return;
+            }
+
+            _mergeCandidates.Add(clicked);
+
+            if (_mergeCandidates.Count < 2)
+            {
+                RefreshKWindow();
+                UpdateSelectionStatusText($"合并模式：已选 {_mergeCandidates.Count}/2，请再点一个图形");
+                return;
+            }
+
+            SelectedCircle first = _mergeCandidates[0];
+            SelectedCircle second = _mergeCandidates[1];
+            _mergeCandidates.Clear();
+
+            SelectedCircle merged = CreateMergedShape(first, second);
+            if (merged == null)
+            {
+                UpdateSelectionStatusText("合并失败：图形已失效");
+                return;
+            }
+
+            if (!IsSingleShapeInShapes(merged, _selectedCircles))
+            {
+                _selectedCircles.Add(merged);
+            }
+
+            // 新点不在任何 Gerber 光圈上 —— 不进图形缓存就是"幽灵点"（画得出来、存得下去、点不中）。
+            AppendOrphanSelections();
+
+            KLog.Info($"合并：({first.X:F4},{first.Y:F4})[{NormalizeHeader(first.HeaderType)}] + " +
+                      $"({second.X:F4},{second.Y:F4})[{NormalizeHeader(second.HeaderType)}] → " +
+                      $"({merged.X:F4},{merged.Y:F4})[{merged.HeaderType}]，图层 {merged.Layer}");
+
+            RefreshKWindow();
+            UpdateSelectionStatusText(
+                $"合并完成 → 新点 ({merged.X:F4}, {merged.Y:F4})，归 {NormalizeHeader(merged.HeaderType)}（原点保留）");
+        }
+
+        /// <summary>
+        /// 由两点生成合并点：位置取**中点**，形状 / 尺寸 / 光圈 ID / 图层归属**沿用第一个**。
+        ///
+        /// 为什么沿用第一个的全部特征，而不是取两者的平均或并集：
+        /// 合并的用途是"两个靠得很近的点其实只要一个插针位"，插的还是同一种焊盘尺寸 ——
+        /// 尺寸取平均会让新点跟任何 Gerber 图形都对不上（画出来比原焊盘大一圈，很难看）。
+        /// 两个点形状不同时（一个圆一个矩形），沿用第一个同样是最可解释的选择。
+        /// </summary>
+        private SelectedCircle CreateMergedShape(SelectedCircle first, SelectedCircle second)
+        {
+            if (first == null || second == null) return null;
+
+            double cx = (first.X + second.X) / 2.0;
+            double cy = (first.Y + second.Y) / 2.0;
+
+            SelectedCircle merged;
+            switch (first.Shape)
+            {
+                case ApertureShape.Rectangle:
+                    merged = new SelectedCircle(cx, cy, first.Width, first.Height);
+                    break;
+
+                case ApertureShape.Oval:
+                    merged = new SelectedCircle(cx, cy, first.Width, first.Height, first.Rotation);
+                    break;
+
+                default:   // 圆
+                    merged = new SelectedCircle(cx, cy, first.Diameter);
+                    break;
+            }
+
+            merged.ID = first.ID;
+            merged.Layer = first.Layer ?? string.Empty;
+            merged.LayerId = first.LayerId;
+            merged.HeaderType = _currentHeaderType;
+            merged.IsSelected = true;
+            return merged;
         }
 
         /// <summary>解除「框选限定」。工具栏按钮 / Esc / 空格 / 右键菜单共用这一个入口。</summary>
@@ -651,11 +1355,61 @@ namespace GerberParserSmartV4._0
                 _canvasMenu?.Dispose();
                 _canvasMenu = new ContextMenuStrip();
 
+                // ---------- 当前模式：点击语义 + 插针头类型 ----------
+                //
+                // 放在**最前面**：这两项决定"接下来点下去会发生什么"，是**上下文无关**的全局状态；
+                // 后面的项都是"针对这一个图形 / 这一片区域"的动作。模式在前、动作在后，层级才清楚。
+                // 尤其 h1/h2/h3 必须一眼看见 —— 当前归错了头，事后要一个个点回来。
+                var singleItem = new ToolStripMenuItem("单选") { Checked = _isSingleClickMode, CheckOnClick = false };
+                var multiItem = new ToolStripMenuItem("多选") { Checked = !_isSingleClickMode, CheckOnClick = false };
+                singleItem.Click += (s, e) =>
+                {
+                    SetClickMode(true);
+                    // 菜单此刻还没关，就地同步勾选 —— 否则要关掉再右键一次才看得出变化
+                    singleItem.Checked = true;
+                    multiItem.Checked = false;
+                };
+                multiItem.Click += (s, e) =>
+                {
+                    SetClickMode(false);
+                    singleItem.Checked = false;
+                    multiItem.Checked = true;
+                };
+                _canvasMenu.Items.Add(singleItem);
+                _canvasMenu.Items.Add(multiItem);
+
+                _canvasMenu.Items.Add(new ToolStripSeparator());
+
+                // 插针头类型：三个互斥项，勾选状态 = 当前归哪个头
+                var headerItems = new ToolStripMenuItem[HeaderTypes.Length];
+                for (int hi = 0; hi < HeaderTypes.Length; hi++)
+                {
+                    string headerName = HeaderTypes[hi];
+                    var headerItem = new ToolStripMenuItem("切换到 " + headerName)
+                    {
+                        Checked = (_currentHeaderType == headerName),
+                        CheckOnClick = false
+                    };
+                    headerItem.Click += (s, e) =>
+                    {
+                        SetCurrentHeader(headerName);
+                        for (int k = 0; k < headerItems.Length; k++)
+                        {
+                            if (headerItems[k] != null) headerItems[k].Checked = (HeaderTypes[k] == headerName);
+                        }
+                    };
+                    headerItems[hi] = headerItem;
+                    _canvasMenu.Items.Add(headerItem);
+                }
+
+                _canvasMenu.Items.Add(new ToolStripSeparator());
+
                 // ---------- 针对光标下那个图形的操作 ----------
                 double actualX, actualY;
                 ReverseMirrorTransform(x, y, out actualX, out actualY);
                 double tolerance = Math.Max(kWindowControl1.Viewport.ToWorldLength(4), 1e-9);
-                SelectedCircle hit = ShapeQuery.HitTest(_allShapes, actualX, actualY, tolerance);
+                // 与左键选点同一口径：图层叠放优先 + 隐藏图层的图形不参与命中
+                SelectedCircle hit = ShapeQuery.HitTest(_allShapes, actualX, actualY, tolerance, DepthForHitTest);
 
                 if (hit != null)
                 {
@@ -777,6 +1531,56 @@ namespace GerberParserSmartV4._0
         };
 
         /// <summary>
+        /// 插针头类型表：顺序 = 工具栏按钮顺序 = 菜单顺序 = 状态栏顺序。
+        /// 三个值只写在这一处，避免"工具栏加了 h4、绘制 / 保存那边忘了同步"。
+        /// </summary>
+        private static readonly string[] HeaderTypes = { "h1", "h2", "h3" };
+
+        /// <summary>
+        /// 把任意来源的头类型折成 h1 / h2 / h3 之一。
+        ///
+        /// 空值、null、"H2"（大小写不一）、以及以后手改过 json 塞进来的陌生值，**一律落到 h1** ——
+        /// 容错方向必须与"默认 h1"一致。若这里改成返回空串，一个拼错的字段就会让那个点的
+        /// 配色查表失败（画不出色），用户看到的是"点凭空消失"。
+        /// </summary>
+        private static string NormalizeHeader(string header)
+        {
+            if (string.IsNullOrEmpty(header)) return "h1";
+
+            string h = header.Trim().ToLowerInvariant();
+            for (int i = 0; i < HeaderTypes.Length; i++)
+            {
+                if (HeaderTypes[i] == h) return h;
+            }
+            return "h1";
+        }
+
+        /// <summary>
+        /// 该图形按哪个颜色画（画布背景是纯黑，色名走控件库 / Halcon 语义）。
+        ///
+        /// 三个头**各有一个颜色设置**，都能在「参数设置」里改（与 V5 一致）：
+        ///   · h1 → `_selectColor`，即设置项 `SelectedCircleColor`（参数界面上写着「h1 颜色」，默认白）。
+        ///     为什么 h1 不用别的名字：这个设置项历史上就叫"选中颜色"，改名会让老用户已经设过的值失效。
+        ///   · h2 → `_headerH2Color`（`HeaderH2Color`，默认黄）
+        ///   · h3 → `_headerH3Color`（`HeaderH3Color`，默认绿）
+        ///
+        /// 为什么把 h1 默认保持白色、而不是 V5 的红色：老工程与老 `circles.json` 里所有点都是 h1
+        /// （字段缺失即默认 h1），照抄 V5 会**一打开满屏白点变红点** —— 那是"升了个版本观感全变"，
+        /// 而用户没要求改配色。默认值的语义在这里必须与"什么都不改"等价。
+        ///
+        /// 空值兜底：设置里读到空串时退回内置默认色，避免老配置文件（没有这两个键）让点画不出色。
+        /// </summary>
+        private string HeaderColorOf(SelectedCircle shape)
+        {
+            switch (NormalizeHeader(shape == null ? null : shape.HeaderType))
+            {
+                case "h2": return string.IsNullOrEmpty(_headerH2Color) ? "yellow" : _headerH2Color;
+                case "h3": return string.IsNullOrEmpty(_headerH3Color) ? "green" : _headerH3Color;
+                default:   return _selectColor;      // h1
+            }
+        }
+
+        /// <summary>
         /// 绘制入口（替代原来的 hWindowControl1_Paint）。
         /// 这里全部用**世界坐标**调用 —— 原来每个图形都要算一遍的
         /// windowX = x * scale + offsetX 已经整体删除，缩放平移由控件负责。
@@ -835,7 +1639,10 @@ namespace GerberParserSmartV4._0
                 DrawAllTemplateCircles(ctx, view);
             }
 
-            // ③ 框选限定框（最上层）：语义已从"我刚才框过的区域"变成"当前批量操作被限定在这一片"，
+            // ③ 合并候选高亮（只有合并模式下、且已点过至少一个时才画）
+            DrawMergeCandidates(ctx, view);
+
+            // ④ 框选限定框（最上层）：语义已从"我刚才框过的区域"变成"当前批量操作被限定在这一片"，
             // 因此必须保留显示 —— 用户看不见限定，就会以为框外的同类点也会被一起改。
             // 内部已判空。
             DrawSelectedRect(ctx);
@@ -861,6 +1668,9 @@ namespace GerberParserSmartV4._0
             {
                 DrawSelectedCircles(ctx, view);
             }
+
+            // 合并候选高亮（合并模式下才有；画在选点之上、限定框之下）
+            DrawMergeCandidates(ctx, view);
 
             // 框选限定框：它同时是"当前批量操作被限定在这一片"的指示灯，必须画出来 ——
             // 看不见限定，用户就会以为框外的同类点也会跟着被改。
@@ -912,16 +1722,31 @@ namespace GerberParserSmartV4._0
             if (_selectedCircles.Count == 0) return;
 
             ctx.SetDraw("fill");
-            ctx.SetColor(_selectColor);
+
+            // 颜色按头类型**逐点**取（h1/h2/h3 三色），但只在真正变化时才调 SetColor：
+            // 控件库的 SetColor 内部要做色名解析，每帧对全部模板点各调一次纯属浪费；
+            // 实际数据里同类点通常是成片连续的，一次遍历下来的切换次数远小于点数。
+            string currentColor = null;
 
             for (int i = 0; i < _selectedCircles.Count; i++)
             {
                 SelectedCircle shape = _selectedCircles[i];
 
+                // 同 DrawSelectedCircles：图层隐藏时，它上面的模板点一并隐藏
+                // （底图那一路已经在 DrawGerberApertures 里过滤过了，两处必须成对）
+                if (!IsShapeLayerVisible(shape)) continue;
+
                 double cx, cy;
                 ApplyMirrorTransform(shape.X, shape.Y, out cx, out cy);
 
                 if (!IsVisibleAt(shape, cx, cy, view)) continue;
+
+                string color = HeaderColorOf(shape);
+                if (color != currentColor)
+                {
+                    ctx.SetColor(color);
+                    currentColor = color;
+                }
 
                 // 世界坐标直接交给控件。几何不预先栅格化，所以放大多少倍都是重新光栅化，
                 // 边缘始终是精确的圆 —— 这正是"缓存 region + 位图缩放"（会发糊）的反面。
@@ -935,13 +1760,57 @@ namespace GerberParserSmartV4._0
             if (_selectedCircles.Count == 0) return;
 
             ctx.SetDraw("fill");
-            ctx.SetColor(_selectColor);
+
+            // 颜色按头类型逐点取（h1/h2/h3），只在变化时才调 SetColor —— 理由同 DrawAllTemplateCircles
+            string currentColor = null;
 
             // 原地遍历 + IsSelected 判断，不再先 Where(...).ToList() 分配一份新列表
             for (int i = 0; i < _selectedCircles.Count; i++)
             {
                 SelectedCircle shape = _selectedCircles[i];
                 if (!shape.IsSelected) continue;
+
+                // 图层被隐藏 → 它上面的选点跟着一起藏起来。
+                // 选点是**独立于底图**画的第二遍（底图在 DrawGerberApertures 里已按显隐过滤），
+                // 漏了这一句就会出现"底图没了、选点还悬在原地"——用户看不见底图，却能看到一堆孤立的点，
+                // 点它还照样能选中（命中测试的 DepthForHitTest 会拒绝，见那里）。两处必须成对。
+                if (!IsShapeLayerVisible(shape)) continue;
+
+                double cx, cy;
+                ApplyMirrorTransform(shape.X, shape.Y, out cx, out cy);
+
+                if (!IsVisibleAt(shape, cx, cy, view)) continue;
+
+                string color = HeaderColorOf(shape);
+                if (color != currentColor)
+                {
+                    ctx.SetColor(color);
+                    currentColor = color;
+                }
+
+                DispShape(ctx, shape, cx, cy);
+            }
+        }
+
+        /// <summary>
+        /// 合并候选的高亮（合并模式下才画）。
+        ///
+        /// 为什么要在选点之后**再画一遍轮廓**，而不是"把候选点改成某个醒目颜色"：
+        /// 候选是**临时的、与选中状态无关**的一份清单（见 _mergeCandidates 的注释），
+        /// 改色就得动图形本身的 HeaderType —— 那等于"看一眼候选就把用户的头类型分配改了"。
+        /// 描一圈轮廓只影响这一帧的观感，退出合并模式立刻不留痕迹。
+        /// </summary>
+        private void DrawMergeCandidates(KWindow ctx, RectangleF view)
+        {
+            if (!_isMergeMode || _mergeCandidates.Count == 0) return;
+
+            ctx.SetDraw("margin");
+            ctx.SetColor("gold");
+
+            for (int i = 0; i < _mergeCandidates.Count; i++)
+            {
+                SelectedCircle shape = _mergeCandidates[i];
+                if (shape == null || !IsShapeLayerVisible(shape)) continue;
 
                 double cx, cy;
                 ApplyMirrorTransform(shape.X, shape.Y, out cx, out cy);
@@ -974,8 +1843,9 @@ namespace GerberParserSmartV4._0
                 List<Aperture> apertures = layer.Apertures;
                 if (apertures == null || apertures.Count == 0) continue;
 
-                // 整层一个颜色（不是整层里每个光圈一个颜色）
-                ctx.SetColor(GetLayerColor(li));
+                // 整层一个颜色（不是整层里每个光圈一个颜色）；色号取自 LayerInfo.ColorIndex，
+                // 与"当前第几层"解耦 —— 置顶重排不会让颜色跟着跳。
+                ctx.SetColor(GetLayerColor(layer));
 
                 for (int ai = 0; ai < apertures.Count; ai++)
                 {
@@ -1021,15 +1891,18 @@ namespace GerberParserSmartV4._0
         }
 
         /// <summary>
-        /// 图层颜色：按图层在 _layers 里的序号取色。
+        /// 图层颜色：按图层的**配色序号**取色（<see cref="LayerInfo.ColorIndex"/>，载入时定下，此后不变）。
+        ///
+        /// 刻意**不按"在 _layers 里的当前序号"**取色：序号会被「置顶」改变 ——
+        /// 那样用户一点置顶，那层的颜色就跳到另一个颜色，看着像又冒出一个 bug。
         ///
         /// 色表 ApertureColors 已按"对纯黑背景对比度 ≥ 4.5:1"筛过（见其定义处的实测数据），
         /// 共 17 项 —— 超过 17 个图层才会开始循环撞色。
         /// </summary>
-        private string GetLayerColor(int layerIndex)
+        private string GetLayerColor(LayerInfo layer)
         {
-            if (layerIndex < 0) layerIndex = 0;
-            return ApertureColors[layerIndex % ApertureColors.Length];
+            int index = (layer != null && layer.ColorIndex >= 0) ? layer.ColorIndex : 0;
+            return ApertureColors[index % ApertureColors.Length];
         }
 
         /// <summary>光圈形状的外接半宽 / 半高（世界单位）。旋转椭圆取保守值，零三角函数。</summary>
@@ -1231,31 +2104,45 @@ namespace GerberParserSmartV4._0
         }
 
 
+        /// <summary>
+        /// 视图 → 参数设置。**只管配色** —— 保存落点不再由这里决定。
+        ///
+        /// 原来这里还会把参数窗体里的"模板文件保存路径"回写进 _currentTemplatePath，后果很具体：
+        /// 那个设置项是个**全局默认值**，用户进来看一眼颜色、顺手点「确定」，工程归属就被它顶掉了
+        /// —— 之后点「保存」写去的是那个默认目录，当前工程里什么都没有，而状态栏照样报"已保存"。
+        /// 该设置项已随本轮一并移除，落点只由"当前工程目录 / 用户当场选择"决定，
+        /// 任何"顺带改个设置"的动作都不该动它。
+        /// </summary>
         private void btnParamSetting_Click(object sender, EventArgs e)
         {
             ParamsForm paramsForm = new ParamsForm();
-            //设置当前保存路径到参数窗体
-            string currentPath = GetCurrentSavePath();
-            paramsForm.SetSavePath(currentPath);
 
-            // 传递当前颜色设置
+            // 传递当前设置（默认工作路径 + h1 / h2 / h3 三行颜色）
+            paramsForm.SetDefaultRootPath(GetDefaultProjectRoot());   // 显示解析后的有效值（人看得懂）
             paramsForm.SetSelectColor(_selectColor);
+            paramsForm.SetHeaderColors(_headerH2Color, _headerH3Color);
             if (paramsForm.ShowDialog() == DialogResult.OK)
             {
-                //1.从界面获取文本框内容，更新保存路径
-                string newPath = paramsForm.GetSavePath();
-                //2.从界面获取颜色设置
+                // 从界面获取颜色设置
                 _selectColor = paramsForm.GetSelectColor();
+                _headerH2Color = paramsForm.GetHeaderH2Color();
+                _headerH3Color = paramsForm.GetHeaderH3Color();
+
                 Properties.Settings.Default.SelectedCircleColor = _selectColor;
+                Properties.Settings.Default.HeaderH2Color = _headerH2Color;
+                Properties.Settings.Default.HeaderH3Color = _headerH3Color;
+
+                // 「默认工作路径」**只存进设置**，绝不去碰 _currentTemplatePath。
+                // 🔴 这条边界正是历史上那个缺陷的分水岭：那个路径设置项当年越界去顶替了工程归属，
+                //    于是"打开工程 A → 改个颜色 → 点确定 → 再保存"会把内容写去别处（见
+                //    MD文件汇总（AI）/问题&解决方案/参数设置确定按钮改写工程归属.md）。
+                //    它现在的唯一作用是**各类目录对话框的初值**。
+                Properties.Settings.Default.DefaultProjectRootPath = paramsForm.GetDefaultRootPath();
+
                 Properties.Settings.Default.Save(); // 保存到配置文件
 
-                UpdateSavePath(newPath);
-                //更新当前模板文件夹路径
-                if (!string.IsNullOrEmpty(newPath) && Directory.Exists(newPath))
-                {
-                    _currentTemplatePath = newPath;
-                    KLog.Info($"参数设置后更新当前模板文件夹路径: {_currentTemplatePath}");
-                }
+                // 配色刚改过 → 立刻按新颜色重绘。少了这一句，要等下一次选点 / 缩放 / 平移
+                // 才会看到颜色变化，用户会以为"改了没生效"。
                 RefreshKWindow();
             }
         }
@@ -1267,29 +2154,56 @@ namespace GerberParserSmartV4._0
         // 用 lambda 虽然更短，但设计器重新生成 Designer.cs 时会被丢掉。
 
         /// <summary>
-        /// 文件 → 新建工程：多选 Gerber 图层文件。
+        /// 文件 → 新建工程。顺序是**先问工程名 → 再选文件 → 载入完自动落盘**（用户 2026-09-21 指定）。
         ///
-        /// 用 OpenFileDialog 的多选而不是"选目录"，是刻意的：一个工程目录里常常混着丝印、说明、
-        /// 尺寸表等非图层文件，让用户自己挑出要的图层比"扫描整个目录再替他猜"更可控。
+        /// 为什么名字必须问在最前面：新建完成后工程**已经在磁盘上了**，不再需要用户回到主界面
+        /// 再点一次「保存」—— 既然载入完就要存，名字就必须在载入之前定下来。
+        /// 落点优先取「默认工作路径 \ 工程名」，不可用时才当场问（见 AutoSaveNewProject）。
+        ///
+        /// 选文件用 OpenFileDialog 的多选而不是"选目录"，是刻意的：一个工程目录里常常混着丝印、
+        /// 说明、尺寸表等非图层文件，让用户自己挑出要的图层比"扫描整个目录再替他猜"更可控。
         /// 挑错的会在解析器的严格模式下判失败、被跳过并汇总提示。
         /// </summary>
         private void OnNewProjectClick(object sender, EventArgs e)
         {
-            using (var dialog = new OpenFileDialog())
+            // ① 先定工程名
+            string projectName;
+            using (ProjectNameDialog nameDlg = new ProjectNameDialog(
+                "新建工程 —— 第 1 步：工程名", "下一步", string.Empty,
+                Properties.Settings.Default.DefaultProjectRootPath))
             {
-                dialog.Title = "新建工程 —— 选择 Gerber 图层文件（可多选）";
+                if (nameDlg.ShowDialog(this) != DialogResult.OK) return;
+                projectName = nameDlg.ProjectName;
+            }
+
+            // ② 再选 Gerber 文件（可多选）
+            string[] picked;
+            using (OpenFileDialog dialog = new OpenFileDialog())
+            {
+                dialog.Title = $"新建工程「{projectName}」—— 第 2 步：选择 Gerber 图层文件（可多选）";
                 dialog.InitialDirectory = GetGerberBrowseStartPath();
                 // 刻意不设扩展名白名单：GBL / GBS / G1 / .o 这类太杂，白名单只会把人挡在外面
                 dialog.Filter = "所有文件 (*.*)|*.*";
                 dialog.Multiselect = true;
 
                 if (dialog.ShowDialog() != DialogResult.OK) return;
-
-                if (LoadProjectFromFiles(dialog.FileNames))
-                {
-                    RememberLastProject("gerber", dialog.FileNames[0]);
-                }
+                picked = dialog.FileNames;
             }
+
+            // ③ 载入图层（清空重建；归属留空，紧接着由 AutoSaveNewProject 定下来）
+            if (!LoadProjectFromFiles(picked))
+            {
+                MessageBox.Show(
+                    "工程没有创建 —— 所选的 " + picked.Length + " 个文件都没能解析出图形。\r\n\r\n" +
+                    "刚才输入的工程名「" + projectName + "」未写入磁盘。",
+                    "无法载入", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            RememberLastProject("gerber", picked[0]);
+
+            // ④ 载入完就保存 —— 用户不必再点一次「保存」
+            AutoSaveNewProject(projectName);
         }
 
         /// <summary>
@@ -1303,11 +2217,22 @@ namespace GerberParserSmartV4._0
             // 用系统原生的"选择文件夹"对话框（IFileOpenDialog + FOS_PICKFOLDERS），
             // 而不是 FolderBrowserDialog —— 后者是 Vista 前的老式树形选择器，
             // 没有地址栏、不能粘贴路径、不能搜索。详见 FolderPicker.cs 的说明。
-            string last = Properties.Settings.Default.LastProjectPath;
-            if (string.IsNullOrEmpty(last) || !Directory.Exists(last)) last = null;
+            //
+            // 初值优先级（注意：这里要选的是**工程目录本身**，不是"父目录"）：
+            //   ① 用户设置的「默认工作路径」= 各工程目录的**共同父目录**。
+            //      用户一般把所有工程放在同一个地方，从那儿开始最省事 ——
+            //      否则每次都要从"上次那个工程目录"往回退一层再进另一个，白点两下。
+            //   ② 上次打开过的工程目录（kind == "template" 时 LastProjectPath 就是它）
+            //   ③ 都没有 → 交给系统对话框（默认当前工作目录）
+            string startDir = GetDefaultProjectRoot();
+            if (string.IsNullOrEmpty(startDir) || !Directory.Exists(startDir))
+            {
+                string lastPath = Properties.Settings.Default.LastProjectPath;
+                startDir = (!string.IsNullOrEmpty(lastPath) && Directory.Exists(lastPath)) ? lastPath : null;
+            }
 
             string folder = FolderPicker.PickFolder(
-                "打开工程 —— 选择工程目录（含 Gerber 图层，可选 circles.json）", last);
+                "打开工程 —— 选择工程目录（含 Gerber 图层，可选 circles.json）", startDir);
 
             if (string.IsNullOrEmpty(folder)) return;
 
@@ -1762,8 +2687,28 @@ namespace GerberParserSmartV4._0
                 // 点击容差：至少 4 个屏幕像素 —— 缩得很小时小图形也能点得中
                 double tolerance = Math.Max(kWindowControl1.Viewport.ToWorldLength(4), 1e-9);
 
-                SelectedCircle clicked = ShapeQuery.HitTest(candidates, actualX, actualY, tolerance);
-                if (clicked == null) return;
+                // 命中口径：**先比图层叠放、再比距离**（理由见 ShapeQuery.HitTest 的注释）——
+                // 画在上层的图形优先，上层此处没有图形才穿透到下一层。
+                // 隐藏图层的图形由 DepthForHitTest 返回 SkipDepth 跳过：看不见的东西点不中。
+                SelectedCircle clicked = ShapeQuery.HitTest(candidates, actualX, actualY, tolerance, DepthForHitTest);
+
+                if (clicked == null)
+                {
+                    if (_isMergeMode) toolStripStatusLabel1.Text = "合并模式：此处没有图形，请点在图形上";
+                    return;
+                }
+
+                // 诊断：把"这次为什么是它"写进日志（定位选错层时最有用，排查完可整段删除）
+                LogHitDiagnostics(actualX, actualY, tolerance, clicked);
+
+                // 合并模式：点击 = 收「合并候选」，**完全不碰选点语义**（也不解除框选限定）。
+                // 放在这里、而不是混进下面的单选 / 多选分支，是为了让两者**互斥**：
+                // 合并时必须能精确点到"两个图形"，若还按多选扩散"同类一批"，永远凑不出两个点。
+                if (_isMergeMode)
+                {
+                    HandleMergeClick(clicked);
+                    return;
+                }
 
                 // 「框外点击 = 解除框选限定」，单选 / 多选一视同仁（规则只有这一条，见方法注释）
                 bool scopeReleased = ReleaseScopeIfOutside(clicked);
@@ -1826,6 +2771,13 @@ namespace GerberParserSmartV4._0
             // 切换选择状态
             clickedShape.IsSelected = !clickedShape.IsSelected;
 
+            // 选中时写入**当前**头类型。取消选中**不回改**类型 ——
+            // "取消"只是"这次不要它"，不是"把它改成别的头"；下次再选中会按那时的当前类型重新赋值。
+            if (clickedShape.IsSelected)
+            {
+                clickedShape.HeaderType = _currentHeaderType;
+            }
+
             // 更新选中列表：点击的形状被选中 且 已选形状集合中不存在该形状
             if (clickedShape.IsSelected && !IsSingleShapeInShapes(clickedShape, _selectedCircles))
             {
@@ -1858,9 +2810,12 @@ namespace GerberParserSmartV4._0
         /// <summary>
         /// 多选处理：切换"同类的一批点"。
         ///
-        /// "同类"的搜索范围受**框选限定**约束：
+        /// "同类" = **同一图层内、光圈 ID 相同**。ID 只在单个 Gerber 文件内有意义 ——
+        /// GBL 的 D10 与 GTS 的 D10 是两个完全不同的焊盘，跨图层按 ID 扩散会误伤别的层。
+        ///
+        /// 除此之外，搜索范围还受**框选限定**约束：
         ///   · 框还在（_actualSelectedRect 非空）→ 只在框内扩散同类；
-        ///   · 框不在 → 全板扩散。
+        ///   · 框不在 → 在该图层内全板扩散。
         /// 框何时消失（＝限定何时解除）统一由 KWindowControl_KMouseDown 决定：
         /// **点到框外就解除**，单选 / 多选一致。
         ///
@@ -1873,18 +2828,27 @@ namespace GerberParserSmartV4._0
             // 圈定本次"同类扩散"的搜索范围。
             // ⚠ "框外点击解除限定"已经在 KMouseDown 里统一做掉了，
             //   所以这里只要 _actualSelectedRect 非空，就说明本次点击落在框内。
-            IEnumerable<SelectedCircle> searchSource = allShapes;
+            //
+            // 第一道过滤永远是"图层可见"：同 ID 的同类图形可能散布在多个图层上，不过滤就会把
+            // **隐藏图层**上的同类点一起选中 —— 用户看不见那些点，却发现选点数量对不上。
+            // 第二道才是框选限定（两道是**叠加**关系，所以下面用 searchSource.Where 继续收窄）。
+            IEnumerable<SelectedCircle> searchSource = allShapes.Where(IsShapeLayerVisible);
             bool narrowed = false;
 
             if (!_actualSelectedRect.IsEmpty)
             {
                 RectangleF scopeRect = _actualSelectedRect;
-                searchSource = allShapes.Where(c => ShapeQuery.IsVisible(c, scopeRect));
+                searchSource = searchSource.Where(c => ShapeQuery.IsVisible(c, scopeRect));
                 narrowed = true;
             }
 
-            // 获取所有同类型的形状（圆形比较直径，矩形比较宽度和高度）
-            var sameIdShapes = searchSource.Where(c => c.ID == clickedShape.ID).ToList();
+            // 获取所有同类型的形状（圆形比较直径，矩形比较宽度和高度），
+            // **并且限定在与被点图形同一个图层内** —— 光圈 ID 只在单个 Gerber 文件内有意义，
+            // 不限定图层就会把别的层上"碰巧同名"的图形一起改掉。
+            // LayerId 相同即同层（未知归属的图形 LayerId = 0，它们之间仍然互相匹配）。
+            var sameIdShapes = searchSource
+                .Where(c => c.ID == clickedShape.ID && c.LayerId == clickedShape.LayerId)
+                .ToList();
 
             // 判断当前点击的形状是否已被选中
             bool isCurrentlySelected = clickedShape.IsSelected;
@@ -1895,6 +2859,7 @@ namespace GerberParserSmartV4._0
                 foreach (var shape in sameIdShapes)
                 {
                     shape.IsSelected = true;
+                    shape.HeaderType = _currentHeaderType;   // 扩散出来的点按当前头类型归类（与单选同口径）
                     if (!IsSingleShapeInShapes(shape, _selectedCircles))
                     {
                         _selectedCircles.Add(shape);
@@ -1916,13 +2881,23 @@ namespace GerberParserSmartV4._0
             return $"多选切换 {sameIdShapes.Count} 个（{where}）";
         }
         //判断当前一个形状是否存在于形状集合中
+        /// <summary>
+        /// 判断这个图形是否已经在集合里（**按值比较，不是按引用**）。
+        ///
+        /// 比较维度：坐标 + 形状 + **图层** + 尺寸。每一维都不能少：
+        ///   · **图层**（2026-09-21 补）—— 跨图层同坐标同尺寸的图形是两个不同的点。少了这一维，
+        ///     后一个会被判成"已经选过"而加不进 _selectedCircles，表现为"选了却保存不进去"；
+        ///   · **尺寸** —— 同层同坐标的焊盘与它的外形框（直径不同）是两个点。
+        /// 口径必须与 <see cref="ShapeKey"/> 一致，否则会出现"单选选得上、框选选不上"这类自相矛盾的行为。
+        /// </summary>
         public bool IsSingleShapeInShapes(SelectedCircle currentShape, List<SelectedCircle> shapes)
         {
             foreach (var shape in shapes)
             {
                 if (shape.X == currentShape.X &&
                     shape.Y == currentShape.Y &&
-                    shape.Shape == currentShape.Shape)
+                    shape.Shape == currentShape.Shape &&
+                    shape.LayerId == currentShape.LayerId)
                 {
                     // 对于圆形，比较直径
                     if (currentShape.Shape == ApertureShape.Circle && shape.Diameter == currentShape.Diameter)
@@ -1969,24 +2944,73 @@ namespace GerberParserSmartV4._0
         /// 现在改成：一次构建 + 字典 O(1) 复用查找。
         /// </summary>
         /// <summary>
-        /// 图形的**唯一键**：图层 + 坐标 + 形状。
-        ///
-        /// 多图层下必须带图层维度。GBL 与 GBS 经常在同一坐标放尺寸不同的图形，
-        /// 只用 (X, Y, Shape) 会把它们认成同一个 —— 后果是命中测试只认其中一个、
-        /// 框选去重会丢掉另一个、图层显隐也会算错。
-        ///
-        /// 键的使用点（原注释已强调"必须一致"）：
-        ///   ① BuildAllShapes 的 selectedIndex（建索引 + 查索引）
-        ///   ② ApplyRegionSelection 的 selectedKeys（建集合 + 查集合）
-        /// 统一走本方法，避免以后再加维度时又漏掉一处。
+        /// 图形的"尺寸三元组"：把各形状自己的尺寸字段统一成 (sizeX, sizeY, sizeR)，
+        /// 好跟其他维度一起进唯一键。口径与绘制端 / 保存端一致：
+        ///   圆   → (直径, 直径, 0)      矩形 → (宽, 高, 0)      椭圆 → (宽, 高, 旋转角)
         /// </summary>
-        private static ValueTuple<string, double, double, int> ShapeKey(string layer, double x, double y, ApertureShape shape)
+        private static void GetSize(ApertureShape shape, double diameter, double width, double height, double rotation,
+                                    out double sizeX, out double sizeY, out double sizeR)
         {
-            return ValueTuple.Create(layer ?? string.Empty, x, y, (int)shape);
+            switch (shape)
+            {
+                case ApertureShape.Rectangle:
+                    sizeX = width; sizeY = height; sizeR = 0;
+                    break;
+
+                case ApertureShape.Oval:
+                    sizeX = width; sizeY = height; sizeR = rotation;
+                    break;
+
+                default:   // 圆
+                    sizeX = diameter; sizeY = diameter; sizeR = 0;
+                    break;
+            }
         }
 
         /// <summary>
-        /// 图形的**退化键**：只用坐标 + 形状，不带图层。
+        /// 图形的**唯一键**：图层 + 坐标 + 形状 + **尺寸**。四个维度缺一不可：
+        ///
+        ///   · **图层** —— GBL 与 GBS 常在同一坐标放尺寸不同的图形，少了它会把两层认成一个；
+        ///   · **坐标** —— 统一 Math.Round(…, 4)，与保存端同一精度，比对即精确相等（不需要容差）；
+        ///   · **形状** —— 同坐标的圆与矩形必须分得开；
+        ///   · **尺寸**（2026-09-21 补上，原先只有前三项）—— 同一图层、同一坐标、同一形状、
+        ///     **直径不同**的两个圆（真实 Gerber 里很常见：焊盘与它的外形框都落在中心点上）
+        ///     原来会算出**同一个键**。后果不是"少画一个"，而是**错位认领**：
+        ///     建索引时键互相覆盖 → 遍历光圈时同一个选点对象被反复复用 → 缓存里同一对象出现多次、
+        ///     另一个图形则整个消失。症状是"那个点怎么都点不中"，
+        ///     日志里的指纹是**复用数 > 已选点数**（例如"已选 2 个，复用选点对象 8 个"）。
+        ///
+        /// 键的使用点（原来就强调过"必须一致"）：
+        ///   ① BuildAllShapes 的 exactIndex（建索引 + 查索引）
+        ///   ② ApplyRegionSelection 的 selectedKeys（建集合 + 查集合）
+        /// 统一走本方法，避免以后再加维度时又漏掉一处。
+        /// </summary>
+        private static ValueTuple<string, double, double, int, double, double, double> ShapeKey(
+            string layer, double x, double y, ApertureShape shape, double sizeX, double sizeY, double sizeR)
+        {
+            return ValueTuple.Create(layer ?? string.Empty,
+                                     Math.Round(x, 4), Math.Round(y, 4), (int)shape,
+                                     Math.Round(sizeX, 4), Math.Round(sizeY, 4), Math.Round(sizeR, 2));
+        }
+
+        /// <summary>图形（图形缓存 / 选点对象）的键。</summary>
+        private static ValueTuple<string, double, double, int, double, double, double> ShapeKey(SelectedCircle c)
+        {
+            double sx, sy, sr;
+            GetSize(c.Shape, c.Diameter, c.Width, c.Height, c.Rotation, out sx, out sy, out sr);
+            return ShapeKey(c.Layer, c.X, c.Y, c.Shape, sx, sy, sr);
+        }
+
+        /// <summary>光圈上某个位置（坐标）的键。</summary>
+        private static ValueTuple<string, double, double, int, double, double, double> ShapeKey(Aperture a, double x, double y)
+        {
+            double sx, sy, sr;
+            GetSize(a.Shape, a.Diameter, a.Width, a.Height, a.Rotation, out sx, out sy, out sr);
+            return ShapeKey(a.Layer, x, y, a.Shape, sx, sy, sr);
+        }
+
+        /// <summary>
+        /// 图形的**退化键**：只用坐标 + 形状 + 尺寸，**不带图层**。
         ///
         /// 存在的唯一理由：circles.json 在 v2.2 以前**没有存 Layer 字段**，从那种文件恢复出来的
         /// 选点，Layer 全是空串，与 Aperture.Layer（图层文件名）永远对不上。只靠 ShapeKey 的后果
@@ -1996,14 +3020,37 @@ namespace GerberParserSmartV4._0
         /// 坐标取 Math.Round(…, 4)：保存端就是这么写的（SaveTemplateToPath 里的 Math.Round），
         /// 两边做同一次舍入，比对即精确相等，不需要引入容差。
         /// </summary>
-        private static ValueTuple<double, double, int> ShapeKeyLoose(double x, double y, ApertureShape shape)
+        private static ValueTuple<double, double, int, double, double, double> ShapeKeyLoose(
+            double x, double y, ApertureShape shape, double sizeX, double sizeY, double sizeR)
         {
-            return ValueTuple.Create(Math.Round(x, 4), Math.Round(y, 4), (int)shape);
+            return ValueTuple.Create(Math.Round(x, 4), Math.Round(y, 4), (int)shape,
+                                     Math.Round(sizeX, 4), Math.Round(sizeY, 4), Math.Round(sizeR, 2));
+        }
+
+        /// <summary>图形（图形缓存 / 选点对象）的退化键。</summary>
+        private static ValueTuple<double, double, int, double, double, double> ShapeKeyLoose(SelectedCircle c)
+        {
+            double sx, sy, sr;
+            GetSize(c.Shape, c.Diameter, c.Width, c.Height, c.Rotation, out sx, out sy, out sr);
+            return ShapeKeyLoose(c.X, c.Y, c.Shape, sx, sy, sr);
+        }
+
+        /// <summary>光圈上某个位置（坐标）的退化键。</summary>
+        private static ValueTuple<double, double, int, double, double, double> ShapeKeyLoose(Aperture a, double x, double y)
+        {
+            double sx, sy, sr;
+            GetSize(a.Shape, a.Diameter, a.Width, a.Height, a.Rotation, out sx, out sy, out sr);
+            return ShapeKeyLoose(x, y, a.Shape, sx, sy, sr);
         }
 
         private void BuildAllShapes()
         {
             var shapes = new List<SelectedCircle>();
+
+            // 图形缓存重建 = 数据源换了（打开另一个工程 / 重新解析 Gerber）。
+            // 合并候选持有的是**上一批**图形对象的引用，留着会被 DrawMergeCandidates 画成
+            // "幽灵高亮"—— 用户在画面上看到一圈金色轮廓，却已不属于当前工程。
+            _mergeCandidates.Clear();
 
             if (_apertures == null || _apertures.Count == 0)
             {
@@ -2023,25 +3070,57 @@ namespace GerberParserSmartV4._0
             // 全是空串，跟 Aperture.Layer 永远对不上。原来只有级别 ①，于是老工程一打开，
             // 选点全是"幽灵对象"。现在命中 ② 时顺手把真实图层**回填**进选点，
             // 下次保存（v2.2 起会写 Layer）就走精确匹配。
-            var exactIndex = new Dictionary<ValueTuple<string, double, double, int>, SelectedCircle>();
-            var looseIndex = new Dictionary<ValueTuple<double, double, int>, SelectedCircle>();
+            var exactIndex = new Dictionary<ValueTuple<string, double, double, int, double, double, double>, SelectedCircle>();
+            var looseIndex = new Dictionary<ValueTuple<double, double, int, double, double, double>, SelectedCircle>();
 
             for (int i = 0; i < _selectedCircles.Count; i++)
             {
                 SelectedCircle c = _selectedCircles[i];
                 if (c == null) continue;
 
-                exactIndex[ShapeKey(c.Layer, c.X, c.Y, c.Shape)] = c;
-                looseIndex[ShapeKeyLoose(c.X, c.Y, c.Shape)] = c;
+                exactIndex[ShapeKey(c)] = c;
+                looseIndex[ShapeKeyLoose(c)] = c;
+            }
+
+            // 已经复用过的选点对象。**这一层兜底不能省**：万一两个图形算出的键依然相同
+            // （尺寸也分不开的极端情况），没有它就会出现"同一个选点对象被塞进 _allShapes 好几次，
+            // 而真正该在里面的那个图形整个消失"，且日志里只能看出"复用数 > 已选数"这一条线索。
+            // 有了它，每个选点对象最多被复用一次，其余走"新建图形"，缓存里永远是**一对一**。
+            var usedSelected = new HashSet<SelectedCircle>();
+
+            // 光圈 → 所属图层：**用对象引用建立映射**，不做任何字符串匹配。
+            //
+            // 这张表用来给每个图形写 LayerId（图层身份）；之后的"叠放深度 / 是否隐藏"由
+            // RefreshLayerState 按 Id 查出来拷进图形。
+            // 为什么不用 aperture.Layer（文件名）去 _layers 里找同名项：那种匹配只要有一处对不上
+            // 就会**静默失败** —— 所有图形都变成"未知图层"，命中优先级退回纯距离排序，
+            // 表现就是"怎么点都只选到最大的那个圆"，而日志里看不出任何异常。
+            // _layers[li].Apertures 里的 Aperture 对象就是这一层的，引用相等，骗不了人。
+            var ownerOf = new Dictionary<Aperture, LayerInfo>();
+            for (int li = 0; li < _layers.Count; li++)
+            {
+                LayerInfo ly = _layers[li];
+                if (ly == null || ly.Apertures == null) continue;
+
+                for (int k = 0; k < ly.Apertures.Count; k++)
+                {
+                    Aperture ap = ly.Apertures[k];
+                    if (ap != null) ownerOf[ap] = ly;
+                }
             }
 
             int reused = 0;      // 复用了已有选点对象的图形数
             int backfilled = 0;  // 顺手补上图层身份的选点数
+            int unowned = 0;     // 找不到所属图层的光圈数（正常应为 0）
 
             for (int ai = 0; ai < _apertures.Count; ai++)
             {
                 Aperture aperture = _apertures[ai];
-                string layer = aperture.Layer ?? string.Empty;
+
+                LayerInfo owner;
+                bool owned = ownerOf.TryGetValue(aperture, out owner);
+                string layer = owned ? owner.FileName : (aperture.Layer ?? string.Empty);
+                if (!owned) unowned++;
 
                 for (int pi = 0; pi < aperture.Position.Count; pi++)
                 {
@@ -2049,14 +3128,12 @@ namespace GerberParserSmartV4._0
 
                     SelectedCircle existing;
                     bool hit = exactIndex.TryGetValue(
-                        ShapeKey(layer, position.Item1, position.Item2, aperture.Shape),
-                        out existing);
+                        ShapeKey(aperture, position.Item1, position.Item2), out existing);
 
                     if (!hit)
                     {
                         hit = looseIndex.TryGetValue(
-                            ShapeKeyLoose(position.Item1, position.Item2, aperture.Shape),
-                            out existing);
+                            ShapeKeyLoose(aperture, position.Item1, position.Item2), out existing);
 
                         if (hit && existing != null && string.IsNullOrEmpty(existing.Layer))
                         {
@@ -2065,11 +3142,12 @@ namespace GerberParserSmartV4._0
                         }
                     }
 
-                    if (hit && existing != null)
+                    if (hit && existing != null && usedSelected.Add(existing))
                     {
                         // 已选状态与集合成员保持一致：_selectedCircles 里就是"已选"的定义，
                         // 这里显式置真，免得出现"在集合里但 IsSelected 为假"的脱节。
                         existing.IsSelected = true;
+                        existing.LayerId = owned ? owner.Id : 0;   // 图层归属一并接上（json 里不存这个字段）
                         shapes.Add(existing);
                         reused++;
                         continue;
@@ -2094,14 +3172,88 @@ namespace GerberParserSmartV4._0
                     {
                         newShape.ID = aperture.ApertureId;
                         newShape.Layer = layer;
+                        newShape.LayerId = owned ? owner.Id : 0;
                         shapes.Add(newShape);
                     }
                 }
             }
 
             _allShapes = shapes;
+
+            // ③ 收编"不属于任何 Gerber 图形的选点"（合并生成的点、坐标对不上的老选点）——
+            //    必须在 _allShapes 赋值之后调用：它读的就是 _allShapes。
+            AppendOrphanSelections();
+
+            // 形状建好，立刻把图层状态（叠放深度 + 隐藏）拷进每个图形 ——
+            // 不能等 RefreshLayerPanel：命中测试随时可能发生，状态必须先就位。
+            RefreshLayerState();
+
+            // 自检：LayerId 为 0 = 这个图形没接上图层身份 → RefreshLayerState 只能把它的 LayerDepth
+            // 设成 -1，命中排序的"叠放优先"对它整体失效（表现：置顶了也选不到那一层）。
+            // 正常应为 0。非 0 就说明图层 Id 分配晚了（见 EnsureLayerIdentity 注释）或光圈归属失败。
+            int noLayerId = 0;
+            for (int si = 0; si < shapes.Count; si++)
+            {
+                if (shapes[si] != null && shapes[si].LayerId <= 0) noLayerId++;
+            }
+
             KLog.Info($"图形缓存构建完成：{shapes.Count} 个图形（其中已选 {_selectedCircles.Count} 个，" +
-                      $"复用选点对象 {reused} 个，回填图层 {backfilled} 个）");
+                      $"复用选点对象 {reused} 个，回填图层 {backfilled} 个）；" +
+                      $"图层 {_layers.Count} 个，归属失败 {unowned} 个光圈" +
+                      (unowned > 0 ? " ← ⚠ 非 0 表示有光圈不属于任何图层，它们的命中优先级会退化" : "") +
+                      (noLayerId > 0
+                          ? $" ← ⚠ 有 {noLayerId} 个图形没有图层身份（叠放优先级对它们失效，置顶将不起作用）"
+                          : "") +
+                      (reused > _selectedCircles.Count
+                          ? $" ← ⚠ 复用数({reused})超过已选点数({_selectedCircles.Count})，有图形被重复认领"
+                          : ""));
+
+            LogLayerOrder();   // 诊断：把叠放顺序也记一笔，排查"哪层压在上面"最直接
+        }
+
+        /// <summary>
+        /// 把"**不属于任何 Gerber 图形**的选点"收进图形缓存（_allShapes），让它们能被点中、能被取消。
+        ///
+        /// 哪些点会走到这里：
+        ///   · **合并生成的点** —— 坐标是两点的中点，天然不落在任何光圈位置上；
+        ///   · 老 circles.json 里与当前 Gerber 对不上的选点（换过底图、或手工编辑过 json）。
+        ///
+        /// 【为什么必须收】
+        /// 图形缓存是**命中测试、框选、多选扩散的唯一依据**，而选点**绘制**读的是 _selectedCircles。
+        /// 一个点只要不在缓存里，就会出现"画得出来、保存得下去，却**怎么点都没反应**" ——
+        /// 想取消它只剩"清空全部选点"这一条路。V5 里的合并点正是这个状态，这里顺手补上。
+        /// （本工程对"点了没反应"零容忍，见 KWindowControl_KMouseDown 里删掉选点模式门禁那段注释。）
+        ///
+        /// 【代价与边界】
+        ///   · 收进来的点带 `LayerId`（沿用生成它的那个图形），于是它的 LayerDepth / LayerHidden
+        ///     与**同层图形完全一致** —— 该层被隐藏时它一起隐藏，不会赖在画面上；
+        ///   · 它的 ID 也沿用第一个图形，所以"多选同类扩散"会把它和同层同名光圈视为同类（合理）；
+        ///   · 复杂度 O(已选数)，由 HashSet 判重；每次载入工程 / 每次合并各跑一次。
+        /// </summary>
+        private void AppendOrphanSelections()
+        {
+            if (_allShapes == null || _selectedCircles.Count == 0) return;
+
+            var inShapes = new HashSet<SelectedCircle>(_allShapes);
+            int added = 0;
+
+            for (int i = 0; i < _selectedCircles.Count; i++)
+            {
+                SelectedCircle c = _selectedCircles[i];
+                if (c == null) continue;
+                if (!inShapes.Add(c)) continue;      // 复用到位（或重复调用本方法）时直接跳过
+
+                _allShapes.Add(c);
+                added++;
+            }
+
+            if (added > 0)
+            {
+                // 新收进来的点也要拿到图层状态，否则它们的命中优先级停在初始值（-1 = 最底层）
+                RefreshLayerState();
+                KLog.Info($"图形缓存补充：{added} 个选点不属于任何 Gerber 图形（合并点 / 坐标对不上的点），" +
+                          $"已纳入可点范围；缓存合计 {_allShapes.Count} 个");
+            }
         }
 
         // 注：原 GetShapesByPos() 已删除 —— 命中测试改由 ShapeQuery.HitTest 承担。
@@ -2120,6 +3272,14 @@ namespace GerberParserSmartV4._0
                 "左键点图形：\n" +
                 "    单选 — 切换这一个点；\n" +
                 "    多选 — 切换「同类的一批点」（按光圈 ID 判定同类型）。\n\n" +
+                "选点归类（工具栏 h1 / h2 / h3）：\n" +
+                "    当前选中哪个头，接下来选中的点就归哪个头；三种头在画面上用不同颜色画。\n" +
+                "    已经选好的点不会被切换动作改掉 —— 要改就在目标 h 下重新点它，或用框选重新框进来。\n" +
+                "    老工程（没有 h 字段的 circles.json）里的点全部归 h1。\n" +
+                "    右键菜单里也有「单选 / 多选」与「切换到 h1 / h2 / h3」，不必回工具栏。\n\n" +
+                "合并（工具栏「合并」）：\n" +
+                "    进入后依次点两个图形 → 取两者中点生成一个新点，形状与尺寸沿用第一个；\n" +
+                "    原来那两个点保留。再点一次已选为候选的图形可取消它；再点「合并」退出。\n\n" +
                 "框选（按 Q，或点「框选区域」）：一次选中区域内全部图形，Ctrl+Z 撤销。\n\n" +
                 "框选后会留下一个红色虚线框 = 「框选限定」：\n" +
                 "    此时多选只在框内扩散同类点，框外的同类点不受影响；\n" +
@@ -2142,7 +3302,8 @@ namespace GerberParserSmartV4._0
         private void UpdateSelectionStatusText(string prefix = null)
         {
             string head = string.IsNullOrEmpty(prefix)
-                ? $"点击方式：{(_isSingleClickMode ? "单选" : "多选")}"
+                ? $"点击方式：{(_isSingleClickMode ? "单选" : "多选")} · 当前 {_currentHeaderType}"
+                  + (_isMergeMode ? " · 合并模式" : "")
                 : prefix;
 
             string scope = _actualSelectedRect.IsEmpty
@@ -2242,6 +3403,10 @@ namespace GerberParserSmartV4._0
         /// 判定口径仍是 ShapeQuery.IsVisible —— 图形外接矩形与矩形**相交**，
         /// 与视口裁剪同一口径。注意这意味着"框边擦到的图形"也会被计入，
         /// 所以 ApplyRegionSelection 会把命中数报给用户，让口径的松紧可见。
+        ///
+        /// 2026-09-21 增补：本方法**同时过滤掉隐藏图层上的图形**（IsShapeLayerVisible）。
+        /// 它有两个调用方 —— ApplyRegionSelection（真正选中）与右键菜单（显示"范围内 N 个点"），
+        /// 过滤必须放在这里而不是调用方，两处的口径才不会分叉。
         /// </summary>
         private List<SelectedCircle> GetCirclesInSelectedRegion(List<SelectedCircle> allCircles, RectangleF rect)
         {
@@ -2251,7 +3416,11 @@ namespace GerberParserSmartV4._0
             for (int i = 0; i < allCircles.Count; i++)
             {
                 SelectedCircle s = allCircles[i];
-                if (s != null && ShapeQuery.IsVisible(s, rect)) result.Add(s);
+
+                // 隐藏图层的图形不参与框选：用户看不见的东西不该被选中。
+                // 少了这一句，框一次就会把隐藏图层上的图形也收进选点，而画面上毫无痕迹 ——
+                // 等用户重新勾上那层才发现多出一堆点。
+                if (s != null && IsShapeLayerVisible(s) && ShapeQuery.IsVisible(s, rect)) result.Add(s);
             }
             return result;
         }
@@ -2280,12 +3449,12 @@ namespace GerberParserSmartV4._0
 
             List<SelectedCircle> inRegion = GetCirclesInSelectedRegion(_allShapes, rect);
 
-            // 已选索引：同一把键（含图层），保证"已在 _selectedCircles 里"能被 O(1) 判出
-            var selectedKeys = new HashSet<ValueTuple<string, double, double, int>>();
+            // 已选索引：同一把键（含图层与尺寸），保证"已在 _selectedCircles 里"能被 O(1) 判出
+            var selectedKeys = new HashSet<ValueTuple<string, double, double, int, double, double, double>>();
             for (int i = 0; i < _selectedCircles.Count; i++)
             {
                 SelectedCircle c = _selectedCircles[i];
-                selectedKeys.Add(ShapeKey(c.Layer, c.X, c.Y, c.Shape));
+                selectedKeys.Add(ShapeKey(c));
             }
 
             var snapshot = new List<SelectionSnapshot>();
@@ -2296,7 +3465,7 @@ namespace GerberParserSmartV4._0
                 SelectedCircle s = inRegion[i];
                 if (s.IsSelected) continue;   // 本来就是选中状态：既不重复加，也不进撤销快照
 
-                var key = ShapeKey(s.Layer, s.X, s.Y, s.Shape);
+                var key = ShapeKey(s);
                 if (selectedKeys.Add(key))
                 {
                     added.Add(s);
@@ -2304,8 +3473,17 @@ namespace GerberParserSmartV4._0
                 // 键已存在（Gerber 里同位置同形状的重复绘制）时不再入列表，
                 // 但仍要把 IsSelected 置真 —— 否则"视觉已选"与"列表成员"会脱节。
 
-                snapshot.Add(new SelectionSnapshot { Shape = s, WasSelected = false });
+                // 头类型也一起进快照：框选会把新选中的点归到"当前头类型"，撤销时必须一并回滚 ——
+                // 否则 Ctrl+Z 之后点的**数量**回到从前、**归属/颜色**却留在新值上，
+                // 用户看到的是"撤销了一半"，而且没有任何提示能解释这件事。
+                snapshot.Add(new SelectionSnapshot
+                {
+                    Shape = s,
+                    WasSelected = false,
+                    WasHeaderType = s.HeaderType
+                });
                 s.IsSelected = true;
+                s.HeaderType = _currentHeaderType;
             }
 
             if (snapshot.Count == 0)
@@ -2350,6 +3528,7 @@ namespace GerberParserSmartV4._0
                 if (s.IsSelected == snap.WasSelected) continue;   // 之后被别的操作改回去了，不重复处理
 
                 s.IsSelected = snap.WasSelected;
+                s.HeaderType = snap.WasHeaderType;   // 与选中状态一起回滚（框选写入过当前头类型）
                 if (snap.WasSelected)
                 {
                     if (!IsSingleShapeInShapes(s, _selectedCircles)) _selectedCircles.Add(s);
@@ -2469,6 +3648,199 @@ namespace GerberParserSmartV4._0
         // ───────── 多图层：辅助方法 ─────────
 
         /// <summary>
+        /// 重算图层状态，并**刷进每一个图形对象**：
+        ///   <c>SelectedCircle.LayerDepth</c>  = 该图形所属图层在 _layers 里的序号（越大越靠上层）
+        ///   <c>SelectedCircle.LayerHidden</c> = 该图层当前是否被隐藏
+        ///
+        /// 【为什么把状态拷进图形，而不是"用 shape.Layer 去图层表里现查"】
+        /// 现查要求两个字符串逐字符相等。只要有一处对不上（老数据、命名差异、以后改了命名规则），
+        /// 命中优先级与隐藏过滤就会**静默失效** —— 代码看着改了，实际退回"纯按距离排序"，
+        /// 表现就是"不论怎么点，还是只能选中最大的那个圆"，而且没有任何报错可查。
+        /// 归属关系是在 BuildAllShapes 里用**光圈对象引用**建立的，全链路不做字符串匹配。
+        ///
+        /// 调用点（3 处）：载入 / 切换工程（RefreshLayerPanel 的早退之前）、勾选显隐、图层置顶。
+        /// 复杂度 O(图形数 + 图层数)，1.5 万图形约 1 ms。
+        /// </summary>
+        /// <summary>
+        /// 分配图层 Id、重建 Id → LayerInfo 表；顺带把"图层 → 叠放深度"填进 <paramref name="depthOf"/>。
+        ///
+        /// 🔴 **必须在 BuildAllShapes 之前调用**，这是本方法独立存在的唯一理由。
+        /// BuildAllShapes 要把 `owner.Id` 写进每个图形当身份（`LayerId`）；此时 Id 若还没分配
+        /// （初值 0），写进去就是 0。紧接着 RefreshLayerState 按 `LayerId > 0` 查归属会**全部**
+        /// 落进 else 分支，把每个图形的 `LayerDepth` 都设成 -1 —— **全体深度相同**，
+        /// 于是命中排序里"图层叠放优先"那一档**静默失效**：
+        /// 置顶哪个图层都没用，命中退回按距离 / 尺寸挑，表现就是"置顶了还是选到别的图层"。
+        ///
+        /// 这个坑只在"载入后没有第二次 BuildAllShapes"的路径上暴露：
+        ///   · 打开**存过选点**的工程 → 恢复选点时会再跑一次 BuildAllShapes，那时 Id 已分配，
+        ///     于是侥幸正常（所以它藏了很久）；
+        ///   · 新建工程（无选点可恢复）→ 必然中招。
+        /// </summary>
+        private void EnsureLayerIdentity(Dictionary<LayerInfo, int> depthOf)
+        {
+            _layerById.Clear();
+            if (depthOf != null) depthOf.Clear();
+
+            for (int i = 0; i < _layers.Count; i++)
+            {
+                LayerInfo layer = _layers[i];
+                if (layer == null) continue;
+
+                if (layer.Id <= 0) layer.Id = _nextLayerId++;
+                if (layer.ColorIndex < 0) layer.ColorIndex = i;
+
+                _layerById[layer.Id] = layer;
+                if (depthOf != null) depthOf[layer] = i;   // i 越大 = 越后画 = 越靠上层
+            }
+        }
+
+        private void RefreshLayerState()
+        {
+            // ① 分配 Id（只在首次见到时分配，此后永不变）、建 Id → LayerInfo 表、记录每层的深度
+            var depthOf = new Dictionary<LayerInfo, int>(_layers.Count);
+            EnsureLayerIdentity(depthOf);
+
+            // ② 把状态拷进图形
+            for (int i = 0; i < _allShapes.Count; i++)
+            {
+                SelectedCircle s = _allShapes[i];
+                if (s == null) continue;
+
+                LayerInfo owner;
+                int depth;
+                if (s.LayerId > 0 && _layerById.TryGetValue(s.LayerId, out owner)
+                    && depthOf.TryGetValue(owner, out depth))
+                {
+                    s.LayerDepth = depth;
+                    s.LayerHidden = !owner.IsVisible;
+                }
+                else
+                {
+                    s.LayerDepth = -1;      // 未知归属：当作最底层，但**仍可见、仍可被点中**
+                    s.LayerHidden = false;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 该图形所属图层当前是否可见。
+        /// 未知归属（LayerId = 0）按**可见**处理：宁可多画一个，也不能把用户已经选好的点藏起来。
+        /// </summary>
+        private bool IsShapeLayerVisible(SelectedCircle shape)
+        {
+            return shape != null && !shape.LayerHidden;
+        }
+
+        /// <summary>
+        /// 命中测试用的层序委托：**隐藏图层的图形直接跳过**（用户看不见的东西不该被点中），
+        /// 其余返回它所属图层的叠放深度。
+        /// 左键选点与右键菜单共用这一个委托，保证两处口径永远一致。
+        /// </summary>
+        private int DepthForHitTest(SelectedCircle shape)
+        {
+            if (shape == null || shape.LayerHidden) return ShapeQuery.SkipDepth;
+            return shape.LayerDepth;
+        }
+
+        /// <summary>
+        /// 把某个图层移到**最上层**：_layers 的末位 = 最后绘制 = 压在最上面；
+        /// 又因为容器是**倒序**显示的，它会同时排到列表**首行**。
+        ///
+        /// 为什么置顶直接改 _layers 的顺序、而不是记一个"置顶标记"：
+        /// 绘制顺序、命中优先级（LayerDepth）、保存进 circles.json 的图层清单，三者都按 _layers 顺序走，
+        /// 只记标记就要在这三处各判一次。**顺序即真相**最省事。
+        /// 颜色不会跟着跳 —— 配色用的是 LayerInfo.ColorIndex（载入时定下，不随序号变）。
+        /// </summary>
+        private void MoveLayerToTop(int layerIndex)
+        {
+            if (layerIndex < 0 || layerIndex >= _layers.Count) return;
+            if (layerIndex == _layers.Count - 1) return;        // 已经在最上层，无需动作
+
+            LayerInfo layer = _layers[layerIndex];
+            _layers.RemoveAt(layerIndex);
+            _layers.Add(layer);
+
+            KLog.Info($"图层置顶：{layer.FileName}（序号 {layerIndex} → {_layers.Count - 1}，现在压在最上层）");
+            LogLayerOrder();
+
+            // RefreshLayerPanel 内部第一件事就是 RefreshLayerState()，这里仍显式再调一次：
+            // 状态是命中优先级的依据，不该依赖"容器是否已创建"那条分支（方法幂等，代价 O(图形数)）。
+            RefreshLayerState();
+            RefreshLayerPanel();
+            RefreshKWindow();
+
+            toolStripStatusLabel1.Text = $"图层已置顶：{layer.FileName}（压在最上层，并排在列表首行）";
+        }
+
+        /// <summary>容器里某一行点了「置顶」。</summary>
+        private void OnLayerRowTopRequested(int layerIndex)
+        {
+            MoveLayerToTop(layerIndex);
+        }
+
+        /// <summary>
+        /// 把当前图层叠放顺序写进日志（诊断用）：**靠后的层画在上面，命中时优先**。
+        /// 日志里按"从最上层到最下层"列出，与画面上看到的顺序一致。
+        /// 排查完可整段删除，不影响任何功能。
+        /// </summary>
+        private void LogLayerOrder()
+        {
+            var sb = new StringBuilder();
+            for (int i = _layers.Count - 1; i >= 0; i--)
+            {
+                LayerInfo layer = _layers[i];
+                if (layer == null) continue;
+
+                if (sb.Length > 0) sb.Append(" > ");
+                sb.Append(layer.FileName).Append("#").Append(i);
+                if (i == _layers.Count - 1) sb.Append("(最上)");
+                if (!layer.IsVisible) sb.Append("(隐)");
+            }
+            KLog.Info($"图层叠放顺序（从最上层到最下层）：{sb}");
+        }
+
+        /// <summary>
+        /// 选点命中诊断（**只写日志，不参与任何判定**）。
+        ///
+        /// 回答的问题是"这次为什么选中了它"：列出点击位置附近的全部图形及其图层深度，
+        /// 按深度**降序**排列 —— 按当前规则，命中者应当是列表里的第一个。
+        ///   · 命中者不是第一个  → 命中优先级有问题；
+        ///   · 所有深度都一样    → 图层归属没接上（BuildAllShapes 的"归属失败"计数也应非 0）；
+        ///   · 深度符合预期但用户想选别层 → 那是层序问题，用「置顶」调整。
+        /// 排查完可整段删除，不影响功能。
+        /// </summary>
+        private void LogHitDiagnostics(double x, double y, double tolerance, SelectedCircle chosen)
+        {
+            var rect = new RectangleF((float)(x - tolerance), (float)(y - tolerance),
+                                      (float)(tolerance * 2), (float)(tolerance * 2));
+
+            var nearby = new List<SelectedCircle>();
+            for (int i = 0; i < _allShapes.Count; i++)
+            {
+                SelectedCircle s = _allShapes[i];
+                if (s == null || !ShapeQuery.IsVisible(s, rect)) continue;
+
+                nearby.Add(s);
+                if (nearby.Count >= 16) break;     // 够诊断就行，别让日志爆炸
+            }
+
+            nearby.Sort((a, b) => b.LayerDepth.CompareTo(a.LayerDepth));   // 靠上层的排前面
+
+            var sb = new StringBuilder();
+            for (int i = 0; i < nearby.Count; i++)
+            {
+                SelectedCircle s = nearby[i];
+                if (i > 0) sb.Append(" | ");
+                sb.Append(s.Layer).Append("#").Append(s.LayerDepth);
+                if (s.LayerHidden) sb.Append("(隐)");
+            }
+
+            KLog.Info($"选点诊断：点({x:F3},{y:F3})，容差 {tolerance:F4}，附近 {nearby.Count} 个图形" +
+                      $"（按深度降序）[{sb}]；→ 命中 {chosen.Layer}#{chosen.LayerDepth}" +
+                      $"（图层总数 {_layers.Count}{(_layers.Count == 1 ? " ⚠ 只有一个图层" : "")}）");
+        }
+
+        /// <summary>
         /// 清空当前工程的全部状态，回到"没有打开任何工程"。
         ///
         /// 换工程（新建 / 打开 / 关闭）之前必须走这里。否则上一批图层、选点、工程归属、翻转状态
@@ -2520,6 +3892,11 @@ namespace GerberParserSmartV4._0
         /// </summary>
         private void FinishProjectLoad()
         {
+            // 🔴 先把图层 Id 分好 —— BuildAllShapes 要用它当图形的图层身份（LayerId），
+            //    晚这一步就会把 0 写进所有图形，命中排序的"叠放优先"随之静默失效。
+            //    详见 EnsureLayerIdentity 的注释。
+            EnsureLayerIdentity(null);
+
             BuildAllShapes();
             UpdateContentBounds();
             ResetViewToCenter();
@@ -2600,49 +3977,23 @@ namespace GerberParserSmartV4._0
 
             var layers = new List<LayerInfo>();
             var skipped = new List<string>();
-            var parser = new GerberParser();
 
             for (int i = 0; i < filePaths.Count; i++)
             {
                 string path = filePaths[i];
                 string displayName = Path.GetFileName(path);
 
-                try
+                LayerInfo parsed;
+                string reason;
+                if (TryParseLayerFile(path, out parsed, out reason))
                 {
-                    parser.LayerName = displayName;   // GetApertureList 会把它回填到每个 Aperture.Layer
-                    ParseResult result = parser.ParseFile(path, true);
-                    List<Aperture> apertures = parser.GetApertureList();
-
-                    if (!result.Success || apertures == null || apertures.Count == 0)
-                    {
-                        skipped.Add(displayName);
-                        KLog.Info($"新建工程：跳过 {displayName} —— {result.Message}");
-                        continue;
-                    }
-
-                    int positionCount = 0;
-                    for (int k = 0; k < apertures.Count; k++) positionCount += apertures[k].Position.Count;
-                    if (positionCount == 0)
-                    {
-                        skipped.Add(displayName);
-                        KLog.Info($"新建工程：跳过 {displayName} —— 解析后没有任何图形");
-                        continue;
-                    }
-
-                    layers.Add(new LayerInfo
-                    {
-                        FilePath = path,
-                        FileName = displayName,
-                        IsVisible = true,
-                        Apertures = apertures
-                    });
-
-                    KLog.Info($"新建工程：载入图层 {displayName}（{apertures.Count} 个光圈 / {positionCount} 个图形）");
+                    layers.Add(parsed);
+                    KLog.Info($"新建工程：载入图层 {displayName}（{reason}）");
                 }
-                catch (Exception ex)
+                else
                 {
                     skipped.Add(displayName);
-                    KLog.Error($"新建工程：解析 {path} 时异常", ex);
+                    KLog.Info($"新建工程：跳过 {displayName} —— {reason}");
                 }
             }
 
@@ -2671,6 +4022,383 @@ namespace GerberParserSmartV4._0
                 (skipped.Count > 0 ? $"，跳过 {skipped.Count} 个无法解析的文件" : "");
 
             return true;
+        }
+
+        // ───────── 拖放载入（拖文件进窗口 = 追加图层 / 无工程时新建） ─────────
+
+        /// <summary>
+        /// 拖入窗口：只接受"文件拖放"。其余（拖一段文字、拖一个 URL）一律拒绝 ——
+        /// 不接受的表现是光标变禁止符，比"接受了却什么都不做"清楚得多。
+        /// </summary>
+        private void OnFileDragEnter(object sender, DragEventArgs e)
+        {
+            e.Effect = (e.Data != null && e.Data.GetDataPresent(DataFormats.FileDrop))
+                ? DragDropEffects.Copy
+                : DragDropEffects.None;
+        }
+
+        /// <summary>
+        /// 拖放落下：按"当前有没有图层"分派。
+        ///   没有图层 → 等价于「文件 → 新建工程」（清空重建；归属留空，保存时再问落点）
+        ///   已有图层 → **追加图层**（不清状态、不动归属、不重置视图，见 AppendLayersFromFiles）
+        ///
+        /// 拖进来的可能是文件夹，这里只认文件 —— 免得把"拖一个目录"误解成"打开工程"
+        /// （那是「打开工程」入口的语义，两者不该混）。
+        /// </summary>
+        private void OnFileDragDrop(object sender, DragEventArgs e)
+        {
+            if (e.Data == null || !e.Data.GetDataPresent(DataFormats.FileDrop)) return;
+
+            string[] dropped = e.Data.GetData(DataFormats.FileDrop) as string[];
+            if (dropped == null || dropped.Length == 0) return;
+
+            var files = new List<string>();
+            int dirCount = 0;
+            for (int i = 0; i < dropped.Length; i++)
+            {
+                if (Directory.Exists(dropped[i])) dirCount++;
+                else if (File.Exists(dropped[i])) files.Add(dropped[i]);
+            }
+
+            if (files.Count == 0)
+            {
+                MessageBox.Show(
+                    dirCount > 0
+                        ? "拖入的是文件夹。\r\n\r\n要打开一个工程，请用「文件 → 打开工程」选择工程目录。"
+                        : "拖入的内容里没有文件。",
+                    "无法载入", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (_layers.Count == 0)
+            {
+                // 没有工程 → 与「文件 → 新建工程」同一套：载入完就落盘，不必再点保存。
+                //
+                // 顺序与菜单入口略有不同：文件已经拖进来了，所以**先载入、成功了再问名字** ——
+                // 免得用户输完一个名字，才发现拖进来的全是解析不了的文件。
+                if (!LoadProjectFromFiles(files)) return;
+
+                RememberLastProject("gerber", files[0]);
+
+                string suggested = GuessProjectNameFromFile(files[0]);
+                using (ProjectNameDialog nameDlg = new ProjectNameDialog(
+                    "新建工程 —— 工程名", "创建", suggested,
+                    Properties.Settings.Default.DefaultProjectRootPath))
+                {
+                    if (nameDlg.ShowDialog(this) != DialogResult.OK)
+                    {
+                        // 取消 = 放弃这次新建。把刚载入的图层一并撤掉 ——
+                        // 免得界面上留下一个"没有名字、也没有归属"的半成品，
+                        // 用户之后再点「保存」还要被问一次落点，更绕。
+                        ResetProjectState();
+                        toolStripStatusLabel1.Text = "已取消新建工程";
+                        KLog.Info("拖放新建：用户在工程名对话框取消，已撤掉刚载入的图层");
+                        return;
+                    }
+
+                    AutoSaveNewProject(nameDlg.ProjectName);
+                }
+            }
+            else
+            {
+                AppendLayersFromFiles(files);
+            }
+        }
+
+        /// <summary>
+        /// 解析一个 Gerber / 钻孔文件成图层。解析失败、或解析出来一个图形都没有 → 返回 false，
+        /// 并把原因写进 <paramref name="reason"/>。
+        ///
+        /// 抽出来是因为「新建工程」与「拖入追加图层」两条路都要它 ——
+        /// 复制一份的话，以后改解析口径（严格模式、跳过条件）必然漂移成两套行为。
+        /// </summary>
+        private static bool TryParseLayerFile(string path, out LayerInfo layer, out string reason)
+        {
+            layer = null;
+            reason = string.Empty;
+
+            string displayName = Path.GetFileName(path);
+            try
+            {
+                GerberParser parser = new GerberParser();
+                parser.LayerName = displayName;   // GetApertureList 会把它回填到每个 Aperture.Layer
+                ParseResult result = parser.ParseFile(path, true);
+                List<Aperture> apertures = parser.GetApertureList();
+
+                if (!result.Success || apertures == null || apertures.Count == 0)
+                {
+                    reason = result.Message;
+                    return false;
+                }
+
+                int positionCount = 0;
+                for (int k = 0; k < apertures.Count; k++) positionCount += apertures[k].Position.Count;
+                if (positionCount == 0)
+                {
+                    reason = "解析后没有任何图形";
+                    return false;
+                }
+
+                layer = new LayerInfo
+                {
+                    FilePath = path,
+                    FileName = displayName,
+                    IsVisible = true,
+                    Apertures = apertures
+                };
+                reason = $"{apertures.Count} 个光圈 / {positionCount} 个图形";
+                return true;
+            }
+            catch (Exception ex)
+            {
+                reason = ex.Message;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 把一批文件**追加**为当前工程的新图层（拖放进来时走这里）。
+        ///
+        /// 与 <see cref="LoadProjectFromFiles"/> 的区别，条条都是红线：
+        ///   · **不调 ResetProjectState()** —— 那会把图层、选点、工程归属一起清掉，
+        ///     于是"拖一层进来"直接变成"工程没了"；
+        ///   · **不动 _currentTemplatePath / _isTemplateMode** —— 当前工程的归属必须保住，
+        ///     否则之后点「保存」会去问落点，而用户以为还在编辑原来那个工程；
+        ///   · **不调 ResetViewToCenter()** —— 用户正盯着某处看，追加一层不该把视图甩走
+        ///     （包围盒变了，想看全按快捷键就行）；
+        ///   · 新图层追加到 _layers **末尾** —— 末位 = 最后绘制 = 压在最上层，
+        ///     与"图层顺序 = 加载顺序"这条既有语义一致；
+        ///   · 已选点不受影响 —— BuildAllShapes 幂等，且会复用 _selectedCircles 里的对象实例。
+        ///
+        /// 与已有图层**同名**的文件会先问用户：替换（并清掉该层选点）还是跳过。
+        /// </summary>
+        private bool AppendLayersFromFiles(IList<string> filePaths)
+        {
+            if (filePaths == null || filePaths.Count == 0) return false;
+
+            int added = 0;
+            int skipped = 0;
+            var notes = new List<string>();
+
+            for (int i = 0; i < filePaths.Count; i++)
+            {
+                string path = filePaths[i];
+                string displayName = Path.GetFileName(path);
+
+                LayerInfo parsed;
+                string reason;
+                if (!TryParseLayerFile(path, out parsed, out reason))
+                {
+                    skipped++;
+                    notes.Add($"{displayName}：{reason}");
+                    KLog.Info($"拖入图层：跳过 {displayName} —— {reason}");
+                    continue;
+                }
+
+                int existIndex = FindLayerIndexByName(displayName);
+                if (existIndex >= 0)
+                {
+                    int selCount = CountSelectionsOnLayer(_layers[existIndex].Id);
+
+                    string msg = $"图层「{displayName}」已经在工程里了。\r\n\r\n" +
+                        (selCount > 0
+                            ? $"替换后该图层上的 {selCount} 个选点会被清除。\r\n\r\n"
+                            : string.Empty) +
+                        "要用拖入的这份替换它吗？\r\n（选「否」= 跳过这个文件）";
+
+                    DialogResult r = MessageBox.Show(msg, "图层已存在",
+                        MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+                    if (r != DialogResult.Yes)
+                    {
+                        skipped++;
+                        notes.Add($"{displayName}：与已有图层同名，已跳过");
+                        KLog.Info($"拖入图层：{displayName} 与已有图层同名，用户选择跳过");
+                        continue;
+                    }
+
+                    ReplaceLayer(existIndex, parsed);
+                    added++;
+                    KLog.Info($"拖入图层：替换 {displayName}（{reason}）");
+                    continue;
+                }
+
+                parsed.ColorIndex = -1;   // -1 = 未分配，交给容器刷新时按当前序号现分配
+                _layers.Add(parsed);
+                added++;
+                KLog.Info($"拖入图层：新增 {displayName}（{reason}）");
+            }
+
+            if (added == 0)
+            {
+                toolStripStatusLabel1.Text = skipped > 0
+                    ? $"拖入的 {skipped} 个文件都没能加进来"
+                    : "没有可添加的图层";
+                ShowLayerNotes(notes, "没有图层被添加");   // 全失败也要说清原因，否则用户只看到"没反应"
+                return false;
+            }
+
+            // 收尾：重算派生数据 + 刷新界面。**刻意不调 ResetViewToCenter()** —— 见方法注释。
+            EnsureLayerIdentity(null);   // 同理：新图层的 Id 要先分配，BuildAllShapes 才认得出归属
+            RebuildAperturesFromLayers();
+            BuildAllShapes();
+            UpdateContentBounds();
+            RefreshLayerPanel();
+            UpdateScaleLabel();
+            UpdateSelectionCountLabel();
+            RefreshKWindow();
+
+            toolStripStatusLabel1.Text = $"已添加 {added} 个图层" +
+                (skipped > 0 ? $"，跳过 {skipped} 个" : string.Empty);
+
+            if (notes.Count > 0) ShowLayerNotes(notes, $"已添加 {added} 个图层，另有 {skipped} 个未添加");
+            return true;
+        }
+
+        private int FindLayerIndexByName(string fileName)
+        {
+            for (int i = 0; i < _layers.Count; i++)
+            {
+                if (string.Equals(_layers[i].FileName, fileName, StringComparison.OrdinalIgnoreCase))
+                    return i;
+            }
+            return -1;
+        }
+
+        private int CountSelectionsOnLayer(int layerId)
+        {
+            int n = 0;
+            for (int i = 0; i < _selectedCircles.Count; i++)
+            {
+                if (_selectedCircles[i].LayerId == layerId) n++;
+            }
+            return n;
+        }
+
+        /// <summary>
+        /// 用新解析出来的图层**替换** _layers[index]，但保留它原有的 Id / ColorIndex / IsVisible
+        /// 与它在列表中的**位置** —— 位置决定叠放次序，不能因为"换个文件"就跳到最上层；
+        /// 配色和显隐也要沿用，不能因为换个文件就变色 / 变可见。
+        ///
+        /// 🔴 必须**清掉该层上的选点**：替换后图形对象整批换新，旧选点指向的是已经不存在的图形，
+        ///    留着只会变成"点不中的幽灵点"（_allShapes 里没有它们，_selectedCircles 里却还在）。
+        ///    同时要把**框选撤销栈**里的相关快照剔掉 —— 那些快照持有旧对象的引用，
+        ///    撤销时会把它们**加回 _selectedCircles**，幽灵点就此复活。
+        /// </summary>
+        private void ReplaceLayer(int index, LayerInfo parsed)
+        {
+            LayerInfo old = _layers[index];
+
+            parsed.Id = old.Id;                 // 身份（会话内唯一）沿用
+            parsed.ColorIndex = old.ColorIndex; // 配色沿用
+            parsed.IsVisible = old.IsVisible;   // 显隐沿用 —— 用户可能特意藏了这一层
+
+            // ① 清掉该层选点。两份状态要同步：IsSelected 与 _selectedCircles
+            //    （只 Remove 不改 IsSelected，会留下"看着没选中、其实还选着"的脏状态）
+            for (int i = 0; i < _selectedCircles.Count; i++)
+            {
+                if (_selectedCircles[i].LayerId == old.Id) _selectedCircles[i].IsSelected = false;
+            }
+            _selectedCircles.RemoveAll(s => s.LayerId == old.Id);
+
+            // ② 剔除撤销栈里引用旧图形的快照，否则撤销会让它们复活
+            for (int i = 0; i < _regionUndoStack.Count; i++)
+            {
+                _regionUndoStack[i].RemoveAll(snap => snap.Shape != null && snap.Shape.LayerId == old.Id);
+            }
+
+            _layers[index] = parsed;
+        }
+
+        /// <summary>把"跳过 / 失败"的原因列出来给用户看（最多列 15 条，其余折叠计数）。</summary>
+        private static void ShowLayerNotes(List<string> notes, string title)
+        {
+            if (notes == null || notes.Count == 0) return;
+
+            int show = Math.Min(notes.Count, 15);
+            string body = string.Join("\r\n", notes.Take(show).ToArray());
+            if (notes.Count > show) body += $"\r\n...（共 {notes.Count} 条）";
+
+            MessageBox.Show(body, title, MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>
+        /// 两个路径是否指向同一个文件（规范化成全路径后比较）。
+        /// 保存图层时用它区分"就地保存"与"需要复制" —— 见 SaveTemplateToPath 里的说明。
+        /// </summary>
+        private static bool IsSamePath(string a, string b)
+        {
+            if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b)) return false;
+            try
+            {
+                return string.Equals(Path.GetFullPath(a), Path.GetFullPath(b),
+                    StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        /// <summary>
+        /// 新建工程载入完成后的**自动保存** —— 用户不必再回主界面点一次「保存」。
+        ///
+        /// 落点优先取「默认工作路径 \ 工程名」：用户把各工程都放在同一个根目录下，
+        /// 新建时就该直接放进去，不必再问一遍。
+        /// 只有两种情况退回到"当场问用户"：
+        ///   · 没设默认工作路径，或它已经不存在了；
+        ///   · 那个目录**已经存在**（多半是重名 —— 覆盖与否必须由用户决定，不能替他做主）。
+        ///
+        /// 🔴 这与「首次保存」是完全同一套落点语义（有归属就地写回 / 无归属当场问），
+        ///    区别只是它发生在"图层载入完成"之后、不需要用户先点一次保存。
+        /// </summary>
+        /// <returns>true = 工程已落盘；false = 用户取消（工程只存在于内存里）。</returns>
+        private bool AutoSaveNewProject(string projectName)
+        {
+            string root = GetDefaultProjectRoot();
+            string targetFolder = null;
+            string folderName = projectName;
+
+            if (!string.IsNullOrEmpty(root) && Directory.Exists(root) &&
+                !Directory.Exists(Path.Combine(root, projectName)))
+            {
+                targetFolder = Path.Combine(root, projectName);
+                KLog.Info($"新建工程：按默认工作路径自动落盘 {targetFolder}");
+            }
+            else
+            {
+                // 没设默认路径 / 该目录已存在 / 路径失效 → 当场问一次
+                using (SaveProjectDialog dlg = new SaveProjectDialog(
+                    "保存新工程", "保存", projectName, GetProjectParentBrowseDir()))
+                {
+                    if (dlg.ShowDialog(this) != DialogResult.OK)
+                    {
+                        toolStripStatusLabel1.Text =
+                            $"已载入 {_layers.Count} 个图层，但工程尚未保存到磁盘（点「保存」可再存一次）";
+                        KLog.Info("新建工程：用户取消了保存，工程尚未落盘");
+                        return false;
+                    }
+
+                    folderName = dlg.ProjectName;
+                    targetFolder = Path.Combine(dlg.TargetParentDir, folderName);
+                }
+            }
+
+            SaveTemplateToPathWithStateUpdate(targetFolder, folderName);
+            return !string.IsNullOrEmpty(_currentTemplatePath);
+        }
+
+        /// <summary>
+        /// 从 Gerber 文件路径推一个默认工程名 —— 取它**所在目录**的名字，而不是文件名
+        /// （文件名带扩展名，`1516601-00-C_01.GBL` 当工程名不合适）。
+        /// 这只是**默认值**，用户可以改。
+        /// </summary>
+        private static string GuessProjectNameFromFile(string filePath)
+        {
+            if (string.IsNullOrEmpty(filePath)) return string.Empty;
+            string dir = Path.GetDirectoryName(filePath);
+            if (string.IsNullOrEmpty(dir)) return string.Empty;
+            return Path.GetFileName(dir.TrimEnd(
+                Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
         }
 
         /// <summary>
@@ -2761,40 +4489,78 @@ namespace GerberParserSmartV4._0
         }
 
         /// <summary>
-        /// 按 circles.json 里记录的图层清单恢复各层的显示 / 隐藏。
+        /// 按 circles.json 里记录的图层清单，恢复各层的**显示 / 隐藏**与**图层顺序**。
         ///
         /// 只有 v2.1 及以后的文件才有 TemplateInfo.Layers；旧文件（v2.0）没有这一段，
-        /// 此时保持"全部可见"的默认值 —— 不能让老工程因为缺个字段就打开成一片空白。
+        /// 此时保持"全部可见 + 载入顺序" —— 不能让老工程因为缺个字段就打开成一片空白。
+        ///
+        /// 【为什么顺序也要恢复】清单数组就是按保存时的 _layers 顺序写的，顺序天然被持久化。
+        /// 用户「置顶」过的层序必须下次打开原样还原，否则每次开工程都要重新置顶一遍。
         ///
         /// 读取走 dynamic，**字段缺失会抛 RuntimeBinderException**（不是给默认值），
-        /// 所以整段用 try 包住，任何异常都退回"全部可见"。
+        /// 所以整段用 try 包住；ColorIndex 是 v2.3 才有的字段，单独再包一层。
         /// </summary>
         private void ApplyLayerVisibility(dynamic jsonData)
         {
             try
             {
-                dynamic layers = jsonData.TemplateInfo.Layers;
+                // ⚠ 一律用 JToken 的**索引器**取字段，不要用 dynamic 点属性：
+                //    索引器取不到的字段返回 null（好判断），而 dynamic 访问不存在的属性会**抛异常**。
+                //    原来这里用 try/catch 兜 v2.3 才有的 "ColorIndex"，代价是打开老工程时
+                //    **每个图层抛一次 RuntimeBinderException** —— 异常构造 + DLR 绑定失败都很贵，
+                //    实测 6 个图层吃掉 **150 ms**（日志 09:32:09.530 → 09:32:09.680），
+                //    而这正好压在"打开工程"的关键路径上。
+                JToken root = jsonData as JToken;
+                if (root == null) return;
+
+                JToken tinfo = root["TemplateInfo"];
+                JArray layers = tinfo == null ? null : tinfo["Layers"] as JArray;
                 if (layers == null) return;
 
-                int applied = 0;
+                // 文件名 → LayerInfo（只是把 json 里的名字映射回内存对象，映射结果不参与任何判定）
+                var byName = new Dictionary<string, LayerInfo>(StringComparer.OrdinalIgnoreCase);
                 for (int i = 0; i < _layers.Count; i++)
                 {
-                    string name = _layers[i].FileName;
-                    _layers[i].IsVisible = true;          // 默认：找不到对应记录就保持可见
-
-                    foreach (var item in layers)
-                    {
-                        string fileName = (string)item.FileName;
-                        if (string.Equals(fileName, name, StringComparison.OrdinalIgnoreCase))
-                        {
-                            _layers[i].IsVisible = (bool)item.IsVisible;
-                            applied++;
-                            break;
-                        }
-                    }
+                    LayerInfo ly = _layers[i];
+                    if (ly != null && !string.IsNullOrEmpty(ly.FileName)) byName[ly.FileName] = ly;
                 }
 
-                KLog.Info($"打开工程：已恢复 {applied} 个图层的勾选状态");
+                var reordered = new List<LayerInfo>(_layers.Count);
+                var taken = new HashSet<LayerInfo>();
+                int applied = 0;
+
+                foreach (JToken item in layers)
+                {
+                    string fileName = (string)item["FileName"];
+                    if (string.IsNullOrEmpty(fileName)) continue;
+
+                    LayerInfo layer;
+                    if (!byName.TryGetValue(fileName, out layer)) continue;   // 清单里有、目录里没有 → 跳过
+                    if (!taken.Add(layer)) continue;                          // 清单里的重复项
+
+                    JToken vis = item["IsVisible"];
+                    layer.IsVisible = (vis == null || vis.Type != JTokenType.Boolean) || vis.Value<bool>();
+
+                    // v2.3 起才写 ColorIndex；老文件取到 null 就保持 -1，稍后按当前顺序现分配。
+                    JToken ci = item["ColorIndex"];
+                    layer.ColorIndex = (ci != null && ci.Type == JTokenType.Integer) ? ci.Value<int>() : -1;
+
+                    reordered.Add(layer);
+                    applied++;
+                }
+
+                // 清单里没提到的图层（工程目录里新加的文件）：保持相对顺序追加到后面，默认可见
+                for (int i = 0; i < _layers.Count; i++)
+                {
+                    LayerInfo ly = _layers[i];
+                    if (ly == null || taken.Contains(ly)) continue;
+                    ly.IsVisible = true;
+                    reordered.Add(ly);
+                }
+
+                if (reordered.Count == _layers.Count) _layers = reordered;
+
+                KLog.Info($"打开工程：已恢复 {applied} 个图层的勾选状态与图层顺序");
             }
             catch (Exception ex)
             {
@@ -2840,9 +4606,32 @@ namespace GerberParserSmartV4._0
                 }
                 else
                 {
-                    // 还没有归属（刚从 Gerber 模式新建、从没保存过）→ 落到参数设置里的模板路径
-                    targetFolder = Path.Combine(GetBaseTemplatePath(), folderName);
-                    KLog.Info($"在设置路径创建新模板: {targetFolder}");
+                    // 还没有归属（刚从 Gerber 模式新建、从没保存过）→ **当场问用户两件事**：
+                    // 工程叫什么名字、放到哪个上级目录。问完归属就定了，之后再点「保存」
+                    // 一律就地写回，与「打开工程」完全同一条路。
+                    //
+                    // 为什么两件事要一起问：工程名过去是**推**出来的 —— GetProjectName() 在
+                    // 无归属时退化成"第一个 Gerber 文件**所在目录**的名字"，而这里原本只弹一个
+                    // 目录选择器、工程名由程序拼上去，用户没有任何输入点。素材目录叫
+                    // 1516601-00-C，工程就只能叫 1516601-00-C。现在把它从"唯一答案"降级成"默认值"。
+                    //
+                    // 仍然守住交接文档那条规则：**没有归属就等于"还没决定这个工程放哪"**，
+                    // 所以问一次；问完就定，不存在任何"全局默认落点"替用户做主。
+                    using (SaveProjectDialog dlg = new SaveProjectDialog(
+                        "保存新工程", "保存", folderName, GetProjectParentBrowseDir()))
+                    {
+                        if (dlg.ShowDialog(this) != DialogResult.OK)
+                        {
+                            toolStripStatusLabel1.Text = "已取消保存（工程尚未保存到磁盘）";
+                            KLog.Info("新工程首次保存：用户取消了保存对话框");
+                            return;
+                        }
+
+                        folderName = dlg.ProjectName;   // 用户可能改过名字
+                        targetFolder = Path.Combine(dlg.TargetParentDir, folderName);
+                    }
+
+                    KLog.Info($"新工程保存到用户选择的目录: {targetFolder}");
                 }
 
                 // 调用公共保存逻辑
@@ -2902,38 +4691,36 @@ namespace GerberParserSmartV4._0
                 return;
             }
 
-            // 与「打开工程」用同一个现代文件夹选择器（系统原生 IFileOpenDialog），
+            // 与「打开工程」同一个现代文件夹选择器（系统原生 IFileOpenDialog），
             // 让整个程序里的"选目录"体验保持一致 —— 不用老式 FolderBrowserDialog。
-            string initialPath = !string.IsNullOrEmpty(_currentTemplatePath) ?
-                               Path.GetDirectoryName(_currentTemplatePath) :
-                               GetBaseTemplatePath();
-
-            string selectedPath = FolderPicker.PickFolder(
-                $"另存工程 '{folderName}' —— 选择要保存到的上级目录", initialPath);
-
-            if (!string.IsNullOrEmpty(selectedPath))
+            // 另存时工程名**可改** —— 这正是"给工程改名"的正规入口：另存到同一父目录 + 改个名。
+            using (SaveProjectDialog dlg = new SaveProjectDialog(
+                "另存工程", "另存到", folderName, GetProjectParentBrowseDir()))
             {
-                string targetFolder = Path.Combine(selectedPath, folderName);
+                if (dlg.ShowDialog(this) != DialogResult.OK) return;
 
-                    // 调用公共保存逻辑
-                    bool isSaveSuccess = SaveTemplateToPath(targetFolder, folderName);
+                folderName = dlg.ProjectName;
+                string targetFolder = Path.Combine(dlg.TargetParentDir, folderName);
 
-                    // ⚠ 另存成功后必须把"当前模板归属"指到新位置。
-                    //   原实现直接调用**不更新状态**的 SaveTemplateToPath，后果是：另存到新目录之后
-                    //   再点"保存"，内容仍写回**旧**目录 —— 用户以为在新位置编辑，实际两处分叉。
-                    //   （SaveTemplateFile 走的是会更新状态的 SaveTemplateToPathWithStateUpdate，
-                    //     两个入口行为不一致，这里补齐。）
-                    if (isSaveSuccess)
-                    {
-                        _currentTemplatePath = targetFolder;
-                        _isTemplateMode = true;
-                        RememberLastProject("template", targetFolder);   // 同上：开机恢复要落到真存过的那份
-                        KLog.Info($"另存为后更新当前模板文件夹路径: {_currentTemplatePath}");
+                // 调用公共保存逻辑
+                bool isSaveSuccess = SaveTemplateToPath(targetFolder, folderName);
 
-                        UpdateScaleLabel();   // 原为写 label1（已删）：现同时刷新状态栏的工程名与缩放
-                        toolStripStatusLabel1.Text = $"另存为完成，当前模板: {targetFolder}";
-                    }
+                // ⚠ 另存成功后必须把"当前模板归属"指到新位置。
+                //   原实现直接调用**不更新状态**的 SaveTemplateToPath，后果是：另存到新目录之后
+                //   再点"保存"，内容仍写回**旧**目录 —— 用户以为在新位置编辑，实际两处分叉。
+                //   （SaveTemplateFile 走的是会更新状态的 SaveTemplateToPathWithStateUpdate，
+                //     两个入口行为不一致，这里补齐。）
+                if (isSaveSuccess)
+                {
+                    _currentTemplatePath = targetFolder;
+                    _isTemplateMode = true;
+                    RememberLastProject("template", targetFolder);   // 同上：开机恢复要落到真存过的那份
+                    KLog.Info($"另存为后更新当前模板文件夹路径: {_currentTemplatePath}");
+
+                    UpdateScaleLabel();   // 原为写 label1（已删）：现同时刷新状态栏的工程名与缩放
+                    toolStripStatusLabel1.Text = $"另存为完成，当前模板: {targetFolder}";
                 }
+            }
         }
 
 
@@ -2959,10 +4746,187 @@ namespace GerberParserSmartV4._0
             }
         }
 
+        // ── 保存前预检：同坐标重复点（2026-09-21 用户裁定：这种情况不被允许）──
+
+        /// <summary>冲突明细里最多显示的**处数**；超出部分只进日志（几百处弹窗也装不下）。</summary>
+        private const int DuplicateDetailMaxGroups = 50;
+
+        /// <summary>
+        /// 把选点按**落盘坐标**分组，挑出"同一个坐标上不止一个点"的那些组。
+        ///
+        /// 判重口径**只有坐标一项**（用户 2026-09-21 裁定）：不分图层、形状、尺寸、插针头 ——
+        /// 插针机按坐标定位，同一坐标就是同一个落点，多条记录 = 重复插针。
+        ///
+        /// ⚠ 这与图形的四维唯一键 <see cref="ShapeKey"/> 是**两件事**，别混：
+        ///   · `ShapeKey` = 图层 + 坐标 + 形状 + 尺寸，管的是"选点对象 ↔ Gerber 图形"的一一对应，
+        ///     少任何一维都会静默错位认领（见 `MD文件汇总（AI）/问题&解决方案/重复坐标的图形互相顶替.md`），
+        ///     那一套**不能动**；
+        ///   · 本方法是"交付给插针机的落点集合"的去重口径，只认坐标。
+        ///
+        /// 坐标取 Math.Round(…, 4)：与保存端写出的精度是**同一次舍入**，
+        /// 于是比对即精确相等，不需要引入容差。
+        ///
+        /// ⚠ 负零（`-0.0`）**不需要**额外归一 —— 这一层想过，被实测否掉了：
+        /// `Math.Round(-0.00003, 4)` 确实得到 `-0.0`（位模式 0x8000000000000000，与 `+0.0` 不同），
+        /// 但它与 `+0.0` 的 `GetHashCode()` **相同**（都是 0）、`Equals` 为 true，
+        /// 作为 `Dictionary` 键**可以互相命中**，不会漏判。
+        /// 实测环境：.NET Framework 4.8.9345.0（正是本工程的运行目标）。将来若换运行时，再核这条。
+        /// </summary>
+        private List<List<SelectedCircle>> FindDuplicatePositionGroups()
+        {
+            var buckets = new Dictionary<ValueTuple<double, double>, List<SelectedCircle>>();
+
+            for (int i = 0; i < _selectedCircles.Count; i++)
+            {
+                SelectedCircle c = _selectedCircles[i];
+                if (c == null) continue;
+
+                var key = ValueTuple.Create(Math.Round(c.X, 4), Math.Round(c.Y, 4));
+
+                List<SelectedCircle> bucket;
+                if (!buckets.TryGetValue(key, out bucket))
+                {
+                    bucket = new List<SelectedCircle>();
+                    buckets[key] = bucket;
+                }
+                bucket.Add(c);
+            }
+
+            var groups = new List<List<SelectedCircle>>();
+            foreach (KeyValuePair<ValueTuple<double, double>, List<SelectedCircle>> pair in buckets)
+            {
+                if (pair.Value.Count <= 1) continue;
+
+                // 组内按图层叠放**从上层到下层**排：第一行就是命中时会选到的那个，便于判断留谁。
+                // （叠放深度来自 RefreshLayerState 拷进图形的运行期副本，见 SelectedCircle.LayerDepth。）
+                pair.Value.Sort((a, b) => b.LayerDepth.CompareTo(a.LayerDepth));
+                groups.Add(pair.Value);
+            }
+
+            // 按坐标升序 —— 明细顺序每次保存都一致，便于与日志对照
+            groups.Sort((a, b) =>
+            {
+                double ax = Math.Round(a[0].X, 4);
+                double bx = Math.Round(b[0].X, 4);
+                if (ax != bx) return ax.CompareTo(bx);
+                return Math.Round(a[0].Y, 4).CompareTo(Math.Round(b[0].Y, 4));
+            });
+
+            return groups;
+        }
+
+        /// <summary>明细里单个点的尺寸描述（口径与保存端写出的字段一致）。</summary>
+        private static string DescribeShapeSize(SelectedCircle c)
+        {
+            switch (c.Shape)
+            {
+                case ApertureShape.Circle: return $"圆 φ{c.Diameter:F4}";
+                case ApertureShape.Rectangle: return $"矩形 {c.Width:F4}×{c.Height:F4}";
+                case ApertureShape.Oval: return $"椭圆 {c.Width:F4}×{c.Height:F4} 旋转 {c.Rotation:F2}°";
+                default: return $"形状 {(int)c.Shape}";
+            }
+        }
+
+        /// <summary>
+        /// 把冲突组拼成明细文本 —— 弹窗与日志**共用同一份**，保证两边看到的一致。
+        ///
+        /// 每个点带上四项：所在图层、形状尺寸、插针头，另标两种**容易被忽略**的状态：
+        ///   · `⚠ 该图层当前已隐藏` —— 隐藏层的点照样会被写进 json（导出端不做显隐过滤），
+        ///     用户常常没想到"看不见的那层也在里面"；
+        ///   · `⚠ 当前未选中` —— 保存写的是 `_selectedCircles` 全部，不看 `IsSelected`。
+        /// </summary>
+        private string BuildDuplicateDetailText(List<List<SelectedCircle>> groups)
+        {
+            var sb = new StringBuilder();
+
+            int shown = Math.Min(groups.Count, DuplicateDetailMaxGroups);
+            for (int g = 0; g < shown; g++)
+            {
+                List<SelectedCircle> group = groups[g];
+
+                sb.Append('(').Append(group[0].X.ToString("F4"))
+                  .Append(", ").Append(group[0].Y.ToString("F4"))
+                  .Append(")   共 ").Append(group.Count).AppendLine(" 个点");
+
+                for (int i = 0; i < group.Count; i++)
+                {
+                    SelectedCircle c = group[i];
+
+                    sb.Append("    ").Append(i + 1).Append(") ")
+                      .Append(string.IsNullOrEmpty(c.Layer) ? "（无图层：合并点 / 游离点）" : c.Layer)
+                      .Append("  |  ").Append(DescribeShapeSize(c))
+                      .Append("  |  ").Append(NormalizeHeader(c.HeaderType));
+
+                    if (c.LayerHidden) sb.Append("  |  ⚠ 该图层当前已隐藏");
+                    if (!c.IsSelected) sb.Append("  |  ⚠ 当前未选中");
+
+                    sb.AppendLine();
+                }
+
+                sb.AppendLine();
+            }
+
+            if (groups.Count > shown)
+            {
+                sb.Append("…… 共 ").Append(groups.Count).Append(" 处，此处只显示前 ")
+                  .Append(shown).AppendLine(" 处（完整明细见程序目录 logs 下当日日志）");
+            }
+
+            return sb.ToString();
+        }
+
+        /// <summary>
+        /// 保存前的最后一道闸：同一个落盘坐标上只允许有一个点。
+        ///
+        /// 检出冲突 → 弹窗列明细 → 用户选「返回修改」就**中止本次保存（一个文件都不写）**。
+        /// 选「仍然保存」则放行，并把这件事写进日志（记下谁在何时放过了多少处）。
+        ///
+        /// 为什么拦在这里而不是选点处：选点入口有五处（单选 / 多选扩散 / 框选 / 合并 / 游离点收编），
+        /// 逐个设防必漏；隐藏图层场景在选点端也判不准；而且**只有这里**能覆盖老工程里已存下的历史重复点。
+        /// 详见 <see cref="DuplicatePositionDialog"/> 的类注释。
+        /// </summary>
+        /// <returns>true = 可以继续保存；false = 必须中止</returns>
+        private bool ConfirmNoDuplicatePositions()
+        {
+            List<List<SelectedCircle>> groups = FindDuplicatePositionGroups();
+            if (groups.Count == 0) return true;
+
+            int pointCount = 0;
+            for (int i = 0; i < groups.Count; i++) pointCount += groups[i].Count;
+
+            string detail = BuildDuplicateDetailText(groups);
+
+            // 日志先写：万一弹窗阶段出意外，线索也不丢
+            KLog.Warn($"保存前预检：发现 {groups.Count} 处同坐标重复点（涉及 {pointCount} 个点）");
+            KLog.Warn("同坐标重复点明细：" + Environment.NewLine + detail);
+
+            using (DuplicatePositionDialog dlg = new DuplicatePositionDialog(groups.Count, pointCount, detail))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.Yes)
+                {
+                    KLog.Warn("保存已中止：用户选择返回修改（未写入任何文件）");
+                    MessageBox.Show(
+                        "已取消保存，未写入任何文件。\r\n\r\n" +
+                        $"共 {groups.Count} 处同坐标重复点（涉及 {pointCount} 个点），完整明细在程序目录 logs 下的当日日志里。\r\n" +
+                        "请先在画布上取消多余的选点，再重新保存。",
+                        "保存未执行", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return false;
+                }
+            }
+
+            KLog.Warn($"用户确认在 {groups.Count} 处同坐标重复点存在的情况下仍然保存");
+            return true;
+        }
+
         private Boolean SaveTemplateToPath(string targetFolder, string folderName)
         {
             try
             {
+                // 落盘前先过最后一道闸：同一个坐标不允许出现多个点（插针机会重复插针）。
+                // 放在"是否覆盖"确认**之前** —— 先把数据问题解决掉，再谈落点。
+                // 返回 false 时一个文件都不写（图层拷贝与 json 全部跳过），工程归属也不更新。
+                if (!ConfirmNoDuplicatePositions()) return false;
+
                 // 检查文件夹是否已存在
                 bool folderExists = Directory.Exists(targetFolder);
 
@@ -3005,14 +4969,18 @@ namespace GerberParserSmartV4._0
 
                     string targetLayerPath = Path.Combine(targetFolder, layer.FileName);
 
-                    // 就地保存时 targetLayerPath 就是 layer.FilePath 本身，跳过即可（否则等于自己覆盖自己）
-                    if (File.Exists(targetLayerPath))
+                    // 判据是"**是不是同一个文件**"，而不是"目标是否已存在"。
+                    //
+                    // 后者会漏掉一种真实情形：拖入新文件**替换**了同名图层之后，layer.FilePath
+                    // 指向的是别处的那个文件，而工程目录里原有的旧文件还在 —— 只看存在与否就跳过复制，
+                    // 于是"替换"在保存后等于没发生过，下次打开工程看到的还是旧图层。
+                    if (IsSamePath(targetLayerPath, layer.FilePath))
                     {
-                        KLog.Info($"图层文件已存在，跳过复制: {layer.FileName}");
+                        KLog.Info($"图层文件就地保存，跳过复制: {layer.FileName}");
                         continue;
                     }
 
-                    File.Copy(layer.FilePath, targetLayerPath, false);
+                    File.Copy(layer.FilePath, targetLayerPath, true);   // 覆盖：同名不同源时必须更新
                     KLog.Info($"已保存图层文件: {layer.FileName}");
                 }
 
@@ -3052,8 +5020,11 @@ namespace GerberParserSmartV4._0
                         SourceFile = _layers.Count > 0
                             ? _layers[0].FileName
                             : (Path.GetFileName(gerberFilePath) ?? "Unknown"),
-                        // 图层清单（v2.1 新增，可选）：打开工程时据此重建图层容器与各层的勾选状态
-                        Layers = _layers.Select(l => new { l.FileName, l.IsVisible }).ToList(),
+                        // 图层清单（v2.1 新增，可选）：打开工程时据此重建图层容器、
+                        // 恢复各层勾选状态与**图层顺序**（数组顺序 = 保存时的绘制顺序）。
+                        // v2.3 起补 ColorIndex：图层顺序可由用户「置顶」改动，配色不能再用"当前序号"推，
+                        // 存下来才能保证同一个工程每次打开的颜色一致。
+                        Layers = _layers.Select(l => new { l.FileName, l.IsVisible, l.ColorIndex }).ToList(),
                         TotalCount = _selectedCircles.Count,
                         SelectedCount = _selectedCircles.Count(c => c.IsSelected),
                         CircleCount = circles.Count,
@@ -3067,7 +5038,16 @@ namespace GerberParserSmartV4._0
                         // 2.1：TemplateInfo 带 Layers（图层清单 + 各层勾选状态）
                         // 2.2：每个图形带 Layer（图层文件名）。没有它，打开工程时选点对象与
                         //      _allShapes 里的图形对不上号 —— 表现为"点一下重复、再点取消不掉"。
-                        Version = "2.2",
+                        // 2.3：TemplateInfo.Layers 的元素补 ColorIndex（图层顺序可被「置顶」改动，
+                        //      配色不能再用"当前序号"反推）。读取端不校验版本号，老文件照样打开。
+                        // 2.4：每个图形补 Header（插针头类型 h1/h2/h3）。老文件缺这个字段 → 读出即 h1，
+                        //      所以**老工程打开后的颜色与行为跟改动前完全一致**。
+                        // 2.5：坐标从 Positions[] 数组里提出来，直接挂在记录上（X / Y）——
+                        //      每条记录本来就只放一个坐标，那层数组是纯粹的历史包袱，
+                        //      还逼着读端多写一层循环。
+                        //      🔴 用户裁定：**读端也不兼容旧格式**（见 ReadJsonPosition），
+                        //      打开 v2.0~2.4 的老工程，坐标会全部读成 0（点堆在原点）。
+                        Version = "2.5",
                         MirrorState = new
                         {
                             IsMirroredX = _isMirroredX,
@@ -3080,30 +5060,36 @@ namespace GerberParserSmartV4._0
                         {
                             Id = c.ID,
                             Layer = c.Layer ?? string.Empty,
+                            Header = NormalizeHeader(c.HeaderType),   // v2.4：插针头类型 h1/h2/h3
                             SizeX = Math.Round(c.Diameter, 4),
                             SizeY = Math.Round(c.Diameter, 4),
-                            Positions = new[] { new { X = Math.Round(c.X, 4), Y = Math.Round(c.Y, 4) } }
+                            X = Math.Round(c.X, 4),     // v2.5：坐标直接挂在记录上
+                            Y = Math.Round(c.Y, 4)
                         }).ToList(),
 
                         Rectangles = rectangles.Select(r => new
                         {
                             Id = r.ID,
                             Layer = r.Layer ?? string.Empty,
+                            Header = NormalizeHeader(r.HeaderType),   // v2.4
                             Type = (int)ApertureShape.Rectangle,
                             SizeX = Math.Round(r.Width, 4),
                             SizeY = Math.Round(r.Height, 4),
-                            Positions = new[] { new { X = Math.Round(r.X, 4), Y = Math.Round(r.Y, 4) } }
+                            X = Math.Round(r.X, 4),     // v2.5
+                            Y = Math.Round(r.Y, 4)
                         }).ToList(),
 
                         Ovals = ovals.Select(o => new
                         {
                             Id = o.ID,
                             Layer = o.Layer ?? string.Empty,
+                            Header = NormalizeHeader(o.HeaderType),   // v2.4
                             Type = (int)ApertureShape.Oval,
                             SizeX = Math.Round(o.Width, 4),
                             SizeY = Math.Round(o.Height, 4),
                             Rotation = Math.Round(o.Rotation, 2),
-                            Positions = new[] { new { X = Math.Round(o.X, 4), Y = Math.Round(o.Y, 4) } }
+                            X = Math.Round(o.X, 4),     // v2.5
+                            Y = Math.Round(o.Y, 4)
                         }).ToList()
                     },
 
@@ -3145,7 +5131,9 @@ namespace GerberParserSmartV4._0
             using (OpenFileDialog openFileDialog = new OpenFileDialog())
             {
                 openFileDialog.Title = "选择模板圆圈文件";
-                openFileDialog.InitialDirectory = GetBaseTemplatePath();
+                // 起始位置与「另存到 / 打开工程」同一套口径（当前工程的上级目录 → 图层所在目录的上级
+                // → 上次位置 → 桌面）。原来指向"参数设置里的模板路径"，该设置项本轮已移除。
+                openFileDialog.InitialDirectory = GetProjectParentBrowseDir();
                 openFileDialog.Filter = "圆圈数据文件 (*.json)|*.json|所有文件 (*.*)|*.*";
                 openFileDialog.Multiselect = false;
 
@@ -3320,14 +5308,17 @@ namespace GerberParserSmartV4._0
                 {
                     foreach (var circle in shapes.Circles)
                     {
+                        double cx, cy;
+                        ReadJsonPosition((object)circle, out cx, out cy);   // 只认 v2.5 的 X / Y
                         var newCircle = new SelectedCircle(
-                            (double)circle.Positions[0].X,
-                            (double)circle.Positions[0].Y,
+                            cx,
+                            cy,
                             (double)circle.SizeX
                         )
                         {
                             ID = circle.Id?.ToString() ?? "Unknown",
                             Layer = ReadJsonLayer((object)circle),   // v2.2 起才有；老文件读空，靠 BuildAllShapes 回填
+                            HeaderType = ReadJsonHeader((object)circle),   // v2.4 起才有；老文件读空 → h1
                             IsSelected = true
                         };
                         _selectedCircles.Add(newCircle);
@@ -3339,15 +5330,18 @@ namespace GerberParserSmartV4._0
                 {
                     foreach (var rectangle in shapes.Rectangles)
                     {
+                        double rx, ry;
+                        ReadJsonPosition((object)rectangle, out rx, out ry);
                         var newRect = new SelectedCircle(
-                            (double)rectangle.Positions[0].X,
-                            (double)rectangle.Positions[0].Y,
+                            rx,
+                            ry,
                             (double)rectangle.SizeX,
                             (double)rectangle.SizeY
                         )
                         {
                             ID = rectangle.Id?.ToString() ?? "Unknown",
                             Layer = ReadJsonLayer((object)rectangle),   // v2.2 起才有；老文件读空，靠 BuildAllShapes 回填
+                            HeaderType = ReadJsonHeader((object)rectangle),   // v2.4 起才有；老文件读空 → h1
                             IsSelected = true
                         };
                         _selectedCircles.Add(newRect);
@@ -3359,9 +5353,11 @@ namespace GerberParserSmartV4._0
                 {
                     foreach (var oval in shapes.Ovals)
                     {
+                        double ox, oy;
+                        ReadJsonPosition((object)oval, out ox, out oy);
                         var newOval = new SelectedCircle(
-                            (double)oval.Positions[0].X,
-                            (double)oval.Positions[0].Y,
+                            ox,
+                            oy,
                             (double)oval.SizeX,
                             (double)oval.SizeY,
                             (double)(oval.Rotation ?? 0)
@@ -3369,6 +5365,7 @@ namespace GerberParserSmartV4._0
                         {
                             ID = oval.Id?.ToString() ?? "Unknown",
                             Layer = ReadJsonLayer((object)oval),   // v2.2 起才有；老文件读空，靠 BuildAllShapes 回填
+                            HeaderType = ReadJsonHeader((object)oval),   // v2.4 起才有；老文件读空 → h1
                             IsSelected = true
                         };
                         _selectedCircles.Add(newOval);
@@ -3414,83 +5411,183 @@ namespace GerberParserSmartV4._0
                 : token.ToString();
         }
 
-        // 获取基础模板目录
-        private string GetBaseTemplatePath()
+        /// <summary>
+        /// 读选点条目上的 Header 字段（v2.4 起才有：插针头类型 h1 / h2 / h3）。
+        ///
+        /// 必须容错，理由与 <see cref="ReadJsonLayer"/> **完全一样**：读取走 dynamic，
+        /// 字段不存在会抛 `RuntimeBinderException`（不是返回 null），而 v2.4 以前的 circles.json
+        /// 里没有 Header —— 一旦抛出去，外层 catch 会把整个工程判成"选点文件读取失败"，
+        /// 选点全丢，只因为少了一个"缺了就等于 h1"的字段。
+        ///
+        /// 取值统一过一遍 <see cref="NormalizeHeader"/>：空串 / 陌生值都落到 h1，
+        /// 保证"老文件打开后与改动前完全一致"。
+        /// </summary>
+        private static string ReadJsonHeader(object shapeItem)
         {
-            // 优先使用参数设置的路径
-            if (!string.IsNullOrEmpty(Properties.Settings.Default.DefaultSavePath) &&
-                Directory.Exists(Properties.Settings.Default.DefaultSavePath))
-            {
-                return Properties.Settings.Default.DefaultSavePath;
-            }
+            var node = shapeItem as Newtonsoft.Json.Linq.JObject;
+            if (node == null) return "h1";
 
-            // 否则使用默认模板目录
-            string defaultPath = Path.Combine(Application.StartupPath, "template");
-            if (!Directory.Exists(defaultPath))
-            {
-                Directory.CreateDirectory(defaultPath);
-            }
-            return defaultPath;
+            var token = node["Header"];
+            return NormalizeHeader(token == null || token.Type == Newtonsoft.Json.Linq.JTokenType.Null
+                ? null
+                : token.ToString());
         }
+
+        /// <summary>
+        /// 读选点条目上的坐标（**只认 v2.5 格式**：`X` / `Y` 直接挂在记录上）。
+        ///
+        /// 必须容错，理由与 <see cref="ReadJsonLayer"/> 完全一样：不能因为缺一个坐标字段
+        /// 就把整个工程判成"选点文件读取失败"、选点全丢。这里走 JToken 索引器 ——
+        /// 取不到返回 null，不抛异常（用 `dynamic` 点属性会抛 `RuntimeBinderException`）。
+        ///
+        /// 只认数字类型（写端写的就是 JSON number）；拿不到就保持 0，
+        /// 后续 BuildAllShapes 按坐标认领会失败、那个点落到原点，但不会连累整个工程。
+        ///
+        /// 🔴 用户 2026-09-21 裁定：**不兼容 v2.0~2.4 的 `Positions[]` 旧格式**（旧格式已废弃）。
+        /// 打开那种老工程时坐标会全部读成 0（所有点堆在原点）—— 这是**有意为之**，不是 bug。
+        /// </summary>
+        private static void ReadJsonPosition(object shapeItem, out double x, out double y)
+        {
+            x = 0.0;
+            y = 0.0;
+
+            var node = shapeItem as Newtonsoft.Json.Linq.JObject;
+            if (node == null) return;
+
+            TryReadDouble(node["X"], out x);
+            TryReadDouble(node["Y"], out y);
+        }
+
+        /// <summary>把 JToken 当数字读；不是数字（缺失 / null / 字符串 / 对象…）返回 false。</summary>
+        private static bool TryReadDouble(Newtonsoft.Json.Linq.JToken token, out double value)
+        {
+            value = 0.0;
+            if (token == null) return false;
+            if (token.Type != Newtonsoft.Json.Linq.JTokenType.Float &&
+                token.Type != Newtonsoft.Json.Linq.JTokenType.Integer) return false;
+
+            value = token.Value<double>();
+            return true;
+        }
+
         #endregion
 
-        #region 模板文件路径管理方法
-        // 获取当前保存路径
-        private string GetCurrentSavePath()
+        #region 保存落点（选择上级目录）
+        /// <summary>
+        /// "选择上级目录"类对话框的起始位置 —— 另存到 / 新工程首次保存 / 打开模板共用这一处。
+        ///
+        /// 为什么不各写各的：这三处的语义都是"**把这个工程目录放到哪个父目录下**"，
+        /// 起始位置理应同一个优先级推出来。原来各写各的，必然漂移 ——
+        /// 一处看设置项、一处看当前工程目录，最后连"弹出来停在哪"都说不清。
+        ///
+        /// 优先级：
+        ///   ⓪ **用户设置的「默认工作路径」** —— 他把各工程目录都放在同一个地方，
+        ///      那就该从那儿出发，而不是每次从上次那个工程目录再重选一遍。
+        ///      它是"各工程目录的共同父目录"，语义与下面几级完全一致，所以直接当第一优先。
+        ///      ⚠ 空值 / 目录已不存在 → 跳过（用户可能把那个目录移走或删了）。
+        ///   ① 当前工程目录的父目录 —— 另存为就是"换个地方放同名的工程目录"，从原地出发最顺；
+        ///   ② 有图层但还没归属（新建工程后没保存过）→ 取图层所在目录的**父目录**。
+        ///      ⚠ 必须是父目录，不能是图层所在目录本身：对话框的返回值会再拼上工程名
+        ///      （= 图层所在目录名），初值若给目录自己，用户直接确认就会得到
+        ///      `...\1516601-00-C\1516601-00-C` —— 白套一层。
+        ///   ③ 上次打开过的工程目录（kind == "template" 时 LastProjectPath 就是它）；
+        ///   ④ 桌面（与 GetGerberBrowseStartPath 的兜底一致，任何机器上都有意义）。
+        ///
+        /// 每一级都要求父目录**实际存在**才采用 —— 否则系统对话框会自己退化到"我的电脑"，
+        /// 那比给桌面更糟：用户丢掉了全部上下文，还得从头点进去。
+        /// </summary>
+        /// <summary>
+        /// 「默认工作路径」的**有效值**。
+        ///
+        /// 设置项里存的是 **`Broad`** 这样一个**相对路径**（相对程序目录），而不是绝对路径 ——
+        /// 绝对路径一旦写进默认值，换台机器就指向不存在的地方（`Program.FileName` 当年正是这个毛病：
+        /// 默认值硬编码了开发机路径）。于是解析放在这里：
+        ///   · 空       → 程序目录 \ Broad
+        ///   · 相对路径 → 程序目录 \ 它
+        ///   · 绝对路径 → 原样用；**但若它不存在（换了机器 / 被删了）就回退到程序目录 \ Broad**，
+        ///                而不是死抱着一个不存在的路径 —— 那会让后面所有优先级一起落空。
+        /// </summary>
+        private static string GetDefaultProjectRoot()
         {
-            // 优先返回当前工程目录
-            if (!string.IsNullOrEmpty(_currentTemplatePath) && Directory.Exists(_currentTemplatePath))
-            {
-                return _currentTemplatePath;
-            }
+            string configured = Properties.Settings.Default.DefaultProjectRootPath;
+            string fallback = Path.Combine(Application.StartupPath, "Broad");
 
-            // 其次：参数设置里存过的默认保存路径。
-            // LoadSavedPath 不再把它写进 _currentTemplatePath，所以这里得自己兜住 ——
-            // 否则参数设置窗体永远显示不到用户设过的那个路径。
-            if (!string.IsNullOrEmpty(Properties.Settings.Default.DefaultSavePath) &&
-                Directory.Exists(Properties.Settings.Default.DefaultSavePath))
-            {
-                return Properties.Settings.Default.DefaultSavePath;
-            }
+            if (string.IsNullOrEmpty(configured)) return fallback;
+            if (!Path.IsPathRooted(configured)) return Path.Combine(Application.StartupPath, configured);
 
-            // 最后退回默认模板目录
-            string defaultPath = Path.Combine(Application.StartupPath, "template");
-            return defaultPath;
+            return Directory.Exists(configured) ? configured : fallback;
         }
 
-        // 更新保存路径设置
-        private void UpdateSavePath(string newPath)
+        /// <summary>
+        /// 保证「默认工作路径」这个目录**存在**（不存在就建一个）。
+        ///
+        /// 为什么需要：它现在**有默认值**（程序目录下的 `Broad`）。用户在参数设置里什么都不改时，
+        /// 新建工程就该直接落到那儿 —— 目录若不存在，那一步会退化成"弹框问位置"，默认值等于白设。
+        /// 启动时建一次即可（与 `KLog` 建 `logs` 文件夹是同一个套路）。
+        /// 失败**不弹框**：建不出来只是少了点便利，不该拦着用户用程序。
+        /// </summary>
+        private static void EnsureDefaultProjectRoot()
         {
-            if (string.IsNullOrEmpty(newPath) || !Directory.Exists(newPath))
+            try
             {
-                MessageBox.Show("路径不存在或无效，将使用默认路径", "提示",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
+                string root = GetDefaultProjectRoot();
+                if (!Directory.Exists(root)) Directory.CreateDirectory(root);
             }
-
-            // 保存到应用程序设置中
-            Properties.Settings.Default.DefaultSavePath = newPath;
-            Properties.Settings.Default.Save();
-
-            MessageBox.Show($"保存路径已更新为: {newPath}", "提示",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            catch (Exception ex)
+            {
+                KLog.Info($"创建默认工作路径失败（不影响使用，之后会退回让你选位置）：{ex.Message}");
+            }
         }
 
-        // 在程序启动时加载保存的路径
-        //
-        // ⚠ 这里**不再**写 _currentTemplatePath。
-        // 那个字段的语义是"当前打开的工程目录"，而 DefaultSavePath 只是"新建工程时的默认落点"，
-        // 两者不是一回事。原来把它塞进去的副作用很具体：启动后**没有打开任何工程**时点「保存」，
-        // GetProjectName() 会拿 DefaultSavePath 的目录名（通常是 "template"）当工程名，
-        // 于是在 ...\template\template 下又套一层。
-        // 参数设置窗体要显示"当前保存路径"，走 GetCurrentSavePath() 自己的回退即可。
-        private void LoadSavedPath()
+        private string GetProjectParentBrowseDir()
         {
-            string saved = Properties.Settings.Default.DefaultSavePath;
-            if (!string.IsNullOrEmpty(saved) && Directory.Exists(saved))
+            // ⓪ 默认工作路径（用户可改；没改过就是程序目录下的 `Broad`）。
+            //    **只作对话框初值** —— 它绝不参与落点决策
+            //    （落点仍只有两个来源：有归属就地写回 / 无归属当场问，见 SaveTemplateFile）。
+            string configured = GetDefaultProjectRoot();
+            if (!string.IsNullOrEmpty(configured) && Directory.Exists(configured))
+                return configured;
+
+            // ① 当前工程目录的父目录
+            string fromCurrent = GetParentDirIfExists(_currentTemplatePath);
+            if (!string.IsNullOrEmpty(fromCurrent)) return fromCurrent;
+
+            // ② 第一个图层所在目录的父目录（新建工程尚未归属）
+            if (_layers.Count > 0 && !string.IsNullOrEmpty(_layers[0].FilePath))
             {
-                KLog.Info($"默认模板保存路径: {saved}");
+                string fromLayer = GetParentDirIfExists(Path.GetDirectoryName(_layers[0].FilePath));
+                if (!string.IsNullOrEmpty(fromLayer)) return fromLayer;
             }
+
+            // ③ 上次打开过的工程目录。
+            //    LastProjectPath 在 kind == "gerber" 时是**文件**、在 kind == "template" 时是**目录**，
+            //    但两种都只要"它的上一级"，所以这里不必分开处理。
+            if (Properties.Settings.Default.LastProjectKind == "template")
+            {
+                string fromLast = GetParentDirIfExists(Properties.Settings.Default.LastProjectPath);
+                if (!string.IsNullOrEmpty(fromLast)) return fromLast;
+            }
+
+            // ④ 桌面
+            return Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+        }
+
+        /// <summary>
+        /// 取某个目录（或文件）的父目录，且要求它**实际存在**；拿不到就返回 null。
+        ///
+        /// 传进来的既可能是目录也可能是文件，由调用方决定 —— 本方法只做一件事：
+        /// 去掉尾部分隔符后取上一级。路径为空、已经在根上、父目录不存在，三种情况都返回 null，
+        /// 让调用方继续往下一条优先级走。
+        /// </summary>
+        private static string GetParentDirIfExists(string dir)
+        {
+            if (string.IsNullOrEmpty(dir)) return null;
+
+            string trimmed = dir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string parent = Path.GetDirectoryName(trimmed);
+            if (string.IsNullOrEmpty(parent)) return null;
+
+            return Directory.Exists(parent) ? parent : null;
         }
 
         #endregion

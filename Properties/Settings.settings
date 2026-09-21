@@ -2,11 +2,17 @@
 <SettingsFile xmlns="http://schemas.microsoft.com/VisualStudio/2004/01/settings" CurrentProfile="(Default)" GeneratedClassNamespace="GerberParserSmartV4._0.Properties" GeneratedClassName="Settings">
   <Profiles />
   <Settings>
-    <Setting Name="DefaultSavePath" Type="System.String" Scope="User">
-      <Value Profile="(Default)" />
-    </Setting>
     <Setting Name="SelectedCircleColor" Type="System.String" Scope="User">
       <Value Profile="(Default)">white</Value>
+    </Setting>
+    <Setting Name="HeaderH2Color" Type="System.String" Scope="User">
+      <Value Profile="(Default)">yellow</Value>
+    </Setting>
+    <Setting Name="HeaderH3Color" Type="System.String" Scope="User">
+      <Value Profile="(Default)">green</Value>
+    </Setting>
+    <Setting Name="DefaultProjectRootPath" Type="System.String" Scope="User">
+      <Value Profile="(Default)">Broad</Value>
     </Setting>
     <Setting Name="LastProjectKind" Type="System.String" Scope="User">
       <Value Profile="(Default)" />

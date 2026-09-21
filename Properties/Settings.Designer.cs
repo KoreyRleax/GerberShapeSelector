@@ -25,18 +25,6 @@ namespace GerberParserSmartV4._0.Properties {
         
         [global::System.Configuration.UserScopedSettingAttribute()]
         [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
-        [global::System.Configuration.DefaultSettingValueAttribute("")]
-        public string DefaultSavePath {
-            get {
-                return ((string)(this["DefaultSavePath"]));
-            }
-            set {
-                this["DefaultSavePath"] = value;
-            }
-        }
-        
-        [global::System.Configuration.UserScopedSettingAttribute()]
-        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
         [global::System.Configuration.DefaultSettingValueAttribute("white")]
         public string SelectedCircleColor {
             get {
@@ -44,6 +32,55 @@ namespace GerberParserSmartV4._0.Properties {
             }
             set {
                 this["SelectedCircleColor"] = value;
+            }
+        }
+        
+        // h2 / h3 的画布配色（h1 沿用上面的 SelectedCircleColor —— 它历史上就是"选中颜色"，
+        // 改名会让老用户已经设过的值失效，所以保持原名不动）。
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("yellow")]
+        public string HeaderH2Color {
+            get {
+                return ((string)(this["HeaderH2Color"]));
+            }
+            set {
+                this["HeaderH2Color"] = value;
+            }
+        }
+        
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("green")]
+        public string HeaderH3Color {
+            get {
+                return ((string)(this["HeaderH3Color"]));
+            }
+            set {
+                this["HeaderH3Color"] = value;
+            }
+        }
+        
+        // 「默认工作路径」= 用户存放各个工程目录的**共同父目录**（工程们的老家）。
+        //
+        // 默认值 `Broad` 是**相对路径，相对程序目录**（即 exe 旁边的 `Broad` 文件夹）——
+        // 刻意不写绝对路径：`Program.FileName` 当年就硬编码了开发机路径，换台机器直接失效。
+        // 解析在 MainForm.GetDefaultProjectRoot()：相对 → 拼程序目录；绝对 → 原样用（不存在则回退）。
+        //
+        // 🔴 它只做「打开工程 / 另存到 / 新建后首次保存」这些**对话框的初值**，
+        //    绝不参与任何落点决策 —— 落点仍然只有两个来源：有归属就就地写回，
+        //    无归属就当场问用户。历史上叫 DefaultSavePath 的那个设置项正是被
+        //    btnParamSetting_Click 拿去顶替 _currentTemplatePath 才出的缺陷
+        //    （详见 MD文件汇总（AI）/问题&解决方案/参数设置确定按钮改写工程归属.md）。
+        [global::System.Configuration.UserScopedSettingAttribute()]
+        [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
+        [global::System.Configuration.DefaultSettingValueAttribute("Broad")]
+        public string DefaultProjectRootPath {
+            get {
+                return ((string)(this["DefaultProjectRootPath"]));
+            }
+            set {
+                this["DefaultProjectRootPath"] = value;
             }
         }
         

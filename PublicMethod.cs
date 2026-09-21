@@ -75,24 +75,5 @@ namespace GerberParserSmartV4._0
             KLog.Info("========================================");
         }
 
-        // 初始化设置
-        public static void InitializeSettings()
-        {
-            // 如果设置为空或路径不存在，设置为默认模板目录
-            if (string.IsNullOrEmpty(Properties.Settings.Default.DefaultSavePath) ||
-                !Directory.Exists(Properties.Settings.Default.DefaultSavePath))
-            {
-                string defaultPath = Path.Combine(Application.StartupPath, "template");
-                if (!Directory.Exists(defaultPath))
-                {
-                    Directory.CreateDirectory(defaultPath);
-                }
-                Properties.Settings.Default.DefaultSavePath = defaultPath;
-                Properties.Settings.Default.Save();
-                KLog.Info($"初始化默认保存路径: {defaultPath}");
-            }
-
-            KLog.Info($"当前基础模板目录: {Properties.Settings.Default.DefaultSavePath}");
-        }
     }
 }
