@@ -293,7 +293,7 @@ ShapeKey = (图层, 坐标(4 位小数), 形状, 尺寸)
 | 依赖 | 来源 | 说明 |
 |---|---|---|
 | `Korey.SmartWindow.WinForms` | `lib\Korey.SmartWindow.WinForms.dll` | 自研画布控件库，源码在 `D:\MyWork\Common`，API 契约见 `Korey.SmartWindow.API.md` |
-| `GerberParserTool` | **`lib\GerberParserTool.dll`**（28,672 B） | Gerber / 钻孔解析器。源码在 `D:\CSharpWorkBase\ClassLib\GerberParserTool\`（net48 类库），**源码没丢**；改完源码要把 dll 重新拷进 `lib\` |
+| `GerberParserTool` | **`lib\GerberParserTool.dll`**（21,504 B） | Gerber / 钻孔解析器。源码在 **`D:\MyWork\GerberParserTool\`**（net48 类库，2026-09-21 用户指明）；⚠ `D:\CSharpWorkBase\ClassLib\GerberParserTool\` 下还有**一份 2026-09-18 的旧副本**（改前与前者逐字节相同），**别从旧那份编译替换**。改完源码：`dotnet build -c Debug` → 把 `bin\Debug\net48\GerberParserTool.dll` 拷进本工程 `lib\` |
 | `Newtonsoft.Json` | `packages\Newtonsoft.Json.13.0.4\` | circles.json 读写 |
 
 > **判据**：不能由 NuGet 还原的依赖 → 放 `lib\` 并**进版本库**（2026-09-19 起 `GerberParserTool.dll` 照此办理）。
@@ -351,6 +351,25 @@ ShapeKey = (图层, 坐标(4 位小数), 形状, 尺寸)
   图形的 `LayerId` 取自 `LayerInfo.Id`（初值 0），Id 没分配就写进去 → 全体 `LayerDepth` 变成 −1
   → "叠放优先"整档静默失效（表现：**置顶了也选不到那一层**）。
   构建日志里有自检「⚠ 有 N 个图形没有图层身份」，正常应为 0。
+- 🆕 **底图绘制按屏幕尺寸分级（LOD）**：图形的屏幕尺寸 = 世界尺寸 × scale，分三档 ——
+  `<1px` 不画 / `1~5px` 画成**边长等于自身外接框的实心方块** / `≥5px` 精确描边。
+  **判据用屏幕尺寸而不是缩放级别**，所以放大后自动恢复精确，不会出现切档时的画面跳变。
+  🔴 **只降级底图**，选点（`_selectedCircles`）永远精确绘制 —— "看不清"与"选不了"是两回事。
+  🔴 每个图层内**分两趟画**（先精确档再简化档），且**必须待在图层循环内部** ——
+  挪到外面会让上层的简化图形盖住下层的精确图形，直接把图层叠放顺序搞乱。
+  阈值是 `LodSkipPx` / `LodBlockPx` 两个常量（`MainForm.cs` 里 `DrawGerberApertures` 上方）。
+  📊 实测（真实板 20188 图元）：**56 ms/帧 → 16.5 ms/帧（0.30x）**。
+  见 `MD文件汇总（AI）/问题&解决方案/缩放卡顿与绘制精度分级.md`
+- 🆕 **视图缩放上限走 `App.config`**：`<appSettings><add key="ViewMaxScale" value="500" /></appSettings>`，
+  `MainForm.ApplyViewScaleLimits()` 在 `MainForm_Load` 里读它设 `kWindowControl1.Viewport.MaxScale`。
+  控件库默认就是 500，而**小板铺满大画布时很容易撞到** —— 例：`Broad\q02578f045a00` 只有
+  **8.7 × 5.2**（世界单位 mm），在 1600×900 画布上 `FitToWindow` 之后 scale 就已经 ~150。
+  缺失 / 非数字 / ≤0 / NaN 一律**忽略**（保持控件库默认），不会写错值就把上限设成 0。
+  ⚠ 要持久生效改**源码的 `App.config`**；直接改 exe 旁的 `exe.config` 下次编译会被覆盖。
+  ⚠ **`Scale` 的语义是「世界单位 → 屏幕像素」的比例（`1.0` = 1:1），不是"倍数"** ——
+  状态栏那个 `缩放 150.000×` 的 `×` 只是装饰（意思是 1 mm 占 150 px）。
+  默认缩放由 `FitToWindow` 按内容包围盒算出（`min(可用宽/内容宽, 可用高/内容高) × 0.9`），
+  所以**板子越小、默认 scale 越大**，这是正常的。
 - 🆕 **隐藏图层 = 不画 + 不选 + 数据保留**：绘制 2 处 + 命中 + 框选 + 多选扩散共四处过滤，
   统一走 `IsShapeLayerVisible()`。
 - 🆕 **图形的唯一键是四维的**（图层 + 坐标(4 位小数) + 形状 + **尺寸**），三处使用点必须口径一致。

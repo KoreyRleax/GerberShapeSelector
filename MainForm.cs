@@ -5,6 +5,7 @@ using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Configuration;
 using System.Data;
 using System.Drawing;
 using System.IO;
@@ -782,6 +783,9 @@ namespace GerberParserSmartV4._0
             // 默认工作路径现在**有默认值**（程序目录下的 Broad）—— 启动时保证它存在，
             // 否则"新建工程载入完自动落盘"那一步会因为目录不存在而退化成弹框问位置。
             EnsureDefaultProjectRoot();
+
+            // 视图缩放上限从 App.config 读（控件库默认 MaxScale=500；小板铺满大画布时容易撞到）
+            ApplyViewScaleLimits();
 
             // 悬浮工具栏与图层容器都是运行时 new 出来再挂上去的（按钮按行按需生成，设计器无法序列化），
             // 所以必须在这里、控件创建之后构建。
@@ -1820,20 +1824,105 @@ namespace GerberParserSmartV4._0
                 DispShape(ctx, shape, cx, cy);
             }
         }
+        // ── 绘制精度分级（LOD）────────────────────────────────────────────────
+        //
+        // 【为什么要它 —— 实测数据】真实板 q02578f044a00（8 图层 / **20188 个图元** /
+        //   221×133 mm）在默认视图下 scale ≈ 4.88 px/mm；按每个光圈**实际的屏幕尺寸**
+        //   查实测成本表再累加：逐图形精确描边 ≈ **56 ms/帧**（约 18 fps）。
+        //   其中 3~5px 那一档（15660 个，占 77.6%）独占约 **32 ms（57%）** —— 描边圆要
+        //   光栅化曲线，单次 2.4~2.7 μs，是"同尺寸实心方块"的 3~4 倍。
+        //   改成同尺寸方块后同口径 ≈ **16.5 ms/帧**（0.30x），省 70%。
+        //   放大后视野内图元骤减（×2 倍 → 8199 个），所以要救的正是"默认整板视图"这一档。
+        //
+        // 【为什么判据是"屏幕尺寸"而不是"缩放级别"】图形的屏幕尺寸 = 世界尺寸 × scale，
+        //   所以它**自动**等价于"越缩小越粗、越放大越精细"：放大后所有图形都会自己回到精确档。
+        //   不必为"当前第几档"单独维护状态，也就不会出现切档时的画面跳变。
+        //
+        // 【边界】只作用于**底图**（Gerber 光圈）。选点是用户的操作对象，永远精确绘制 ——
+        //   "看不清"与"选不了"是两回事，后者是缺陷。
+        //
+        // 【实测成本（每图形，离屏 GDI+、抗锯齿开、Release、3 轮取中位）】
+        //            1px    2px    3px    4px    6px    8px    12px
+        //   描边圆   1.73   2.44   2.42   2.69   3.80   3.93   4.49 μs   ← 现状
+        //   填充圆   1.04   1.31   1.43   1.63   2.01   2.11   2.55 μs
+        //   实心方块 0.50   0.59   0.65   0.72   0.87   1.05   1.43 μs   ← 简化档取的正是这一档
+        //   → **同尺寸下方块比描边圆便宜 3~4 倍**，而边长取图形自己的外接框，视觉尺寸不变。
+        //   · 合并成一条 GraphicsPath 再画 → **反而慢 1.9~3.5 倍**
+        //     （GDI+ 的路径 figure 一多，内部开销超线性），所以"批量合并成一条路径"
+        //     这条看起来最诱人的路**实测被否掉**。
+
         /// <summary>
-        /// Gerber 光圈绘制：**按图层**着色 + 按图层可见性过滤 + 视口裁剪。
+        /// 低于这个屏幕尺寸（px）不画：真·亚像素 —— 光栅化后最多只覆盖 1 个像素，
+        /// 抗锯齿还会把它摊成一个更暗的点。
         ///
-        /// 与原实现的两处关键差异：
+        /// ⚠ **它在这块真实板上触发 0 次**（最小图形 2.2px），所以它是"极端缩小时"的兜底，
+        /// **不是用来省时间的** —— 真正省时间的是 <see cref="LodBlockPx"/> 那一档。
+        /// 保留它的理由：手动缩到 1/5 以下时图元会真的掉进亚像素，那时跳过是纯赚。
+        /// </summary>
+        private const double LodSkipPx = 1.0;
+        /// <summary>
+        /// 低于这个屏幕尺寸（px）改用**同尺寸实心方块**代替精确描边；再大走精确绘制。
+        ///
+        /// 取 5.0 的依据（真实板 q02578f044a00 的尺寸分布 + 上面那张实测成本表，按每个光圈
+        /// 的**实际屏幕尺寸**插值累加出来的"阈值 → 收益"曲线）：
+        ///
+        ///   阈值px | 降级占比 | 预估 ms/帧 | 相对现状 | 本档比上一档再省
+        ///     1.0  |    0.0%  |      55.8  |   1.00x  |    0.0%
+        ///     2.0  |    0.0%  |      55.8  |   1.00x  |    0.0%
+        ///     3.0  |   19.1%  |      48.8  |   0.87x  |   12.7%
+        ///     3.5  |   20.9%  |      48.1  |   0.86x  |    1.2%
+        ///     4.0  |   58.1%  |      33.4  |   0.60x  |   26.3%
+        ///   **4.5**| **96.5%**| **16.6** |**0.30x**| **30.1%**
+        ///     5.0  |   96.7%  |      16.5  |   0.30x  |    0.1%   ← 取它
+        ///     6.0  |   96.8%  |      16.4  |   0.29x  |    0.2%
+        ///     8.0  |   98.3%  |      15.5  |   0.28x  |    1.4%
+        ///
+        ///   → **拐点在 4.5px**：过了它收益就进平台（4.5 → 8.0 只再省 1.4%），
+        ///     再往上调等于"白拿观感换空气"。取 5.0 是让它落在平台起点、留一点余量
+        ///     （4.5~5px 之间还有个小尾巴）。
+        ///   → 视觉侧：5px 以下"圆 vs 方"在屏幕上分不出来；而方块边长 = 图形自身外接框，
+        ///     所以**视觉尺寸不变**，只抹掉形状细节。6px 以上就能看出圆角被抹掉了。
+        ///   → 3px 太小（只覆盖 19.1%、0.87x，几乎没省）；8px 只在 5px 基础上再省 2%，
+        ///     却要动到"已经能看出圆"的图形。
+        ///
+        /// 调小（如 2.0）只影响真·亚像素图形、观感几乎无损，但省得也少；
+        /// 调大（如 8.0）能再省 2%，代价是 5~8px 的圆角被抹平。
+        /// </summary>
+        private const double LodBlockPx = 5.0;
+
+        /// <summary>
+        /// 绘制精度分档：世界尺寸 + "1 像素等于多少世界单位" → 档位。
+        /// 0 = 精确形状；1 = 同尺寸实心方块；2 = 不画。
+        /// </summary>
+        private static int LodTierOf(double worldSize, double worldPerPixel)
+        {
+            if (worldPerPixel <= 0) return 0;          // 视口未就绪：不降级，宁慢勿错
+
+            double px = worldSize / worldPerPixel;
+            if (px < LodSkipPx) return 2;
+            if (px < LodBlockPx) return 1;
+            return 0;
+        }
+
+        /// <summary>
+        /// Gerber 光圈绘制：**按图层**着色 + 按图层可见性过滤 + 视口裁剪 + **按屏幕尺寸分级**。
+        ///
+        /// 与原实现的关键差异：
         ///   ① 颜色从"按光圈序号 ai 取色"改为**按图层序号取色** —— 同一图层内所有图形同色，
         ///      不同图层不同色。多图层叠加时这样才能分清哪条线属于哪一层；
         ///      原来的画法会让同一层里的不同光圈五颜六色，层与层反而看不出区别。
         ///   ② 跳过 IsVisible == false 的图层 —— 图层容器的复选框就是控制这里的。
+        ///   ③ 每个图层内部**分两趟画**（先精确档、再简化档）。两趟是必需的：
+        ///      SetDraw 状态切换要降到"每图层 1 次"而不是"每图形 1 次"；
+        ///      而两趟又**必须放在图层循环内部** —— 挪到外面会让上层的简化图形盖住
+        ///      下层的精确图形，直接把图层叠放顺序搞乱。
         /// </summary>
         private void DrawGerberApertures(KWindow ctx, RectangleF view)
         {
             if (_layers.Count == 0) return;
 
-            ctx.SetDraw("margin");
+            // 1 像素对应多少世界单位 —— 每帧只算一次，循环里只做乘除与比较
+            double worldPerPixel = kWindowControl1.Viewport.ToWorldLength(1.0);
 
             for (int li = 0; li < _layers.Count; li++)
             {
@@ -1847,43 +1936,60 @@ namespace GerberParserSmartV4._0
                 // 与"当前第几层"解耦 —— 置顶重排不会让颜色跟着跳。
                 ctx.SetColor(GetLayerColor(layer));
 
-                for (int ai = 0; ai < apertures.Count; ai++)
+                for (int pass = 0; pass < 2; pass++)
                 {
-                    Aperture aperture = apertures[ai];
-                    if (aperture.Position.Count == 0) continue;
+                    // pass 0 = 精确档（描边，与原实现一致）；pass 1 = 简化档（实心方块）
+                    ctx.SetDraw(pass == 0 ? "margin" : "fill");
 
-                    // 该光圈尺寸对应的外接半宽/半高只算一次，循环里只做四次比较
-                    double halfW, halfH;
-                    ApertureHalfExtents(aperture, out halfW, out halfH);
-
-                    for (int pi = 0; pi < aperture.Position.Count; pi++)
+                    for (int ai = 0; ai < apertures.Count; ai++)
                     {
-                        var position = aperture.Position[pi];
+                        Aperture aperture = apertures[ai];
+                        if (aperture.Position.Count == 0) continue;
 
-                        double cx, cy;
-                        ApplyMirrorTransform(position.Item1, position.Item2, out cx, out cy);
+                        // 该光圈尺寸对应的外接半宽/半高只算一次，循环里只做四次比较
+                        double halfW, halfH;
+                        ApertureHalfExtents(aperture, out halfW, out halfH);
 
-                        // 视口裁剪：屏幕外的图形连绘制调用都不发出去
-                        if ((cx + halfW) < view.Left || (cx - halfW) > view.Right ||
-                            (cy + halfH) < view.Top || (cy - halfH) > view.Bottom)
-                        {
-                            continue;
-                        }
+                        // 档位在**光圈级**判定：同一光圈的尺寸相同，判一次就够 ——
+                        // 被整只跳过（档位 2）的光圈连位置循环都不用进。
+                        int tier = LodTierOf(Math.Max(halfW, halfH) * 2.0, worldPerPixel);
+                        if (tier >= 2) continue;                      // 亚像素：不画
+                        if ((tier == 0) != (pass == 0)) continue;     // 不属于本趟
 
-                        if (aperture.Shape == ApertureShape.Circle)
+                        for (int pi = 0; pi < aperture.Position.Count; pi++)
                         {
-                            ctx.DispCircle(cy, cx, aperture.Diameter / 2.0);
-                        }
-                        else if (aperture.Shape == ApertureShape.Rectangle)
-                        {
-                            double hw = aperture.Width / 2.0;
-                            double hh = aperture.Height / 2.0;
-                            ctx.DispRectangle1(cy - hh, cx - hw, cy + hh, cx + hw);
-                        }
-                        else if (aperture.Shape == ApertureShape.Oval)
-                        {
-                            ctx.DispEllipse2(cy, cx, aperture.Rotation * Math.PI / 180.0,
-                                             aperture.Width / 2.0, aperture.Height / 2.0);
+                            var position = aperture.Position[pi];
+
+                            double cx, cy;
+                            ApplyMirrorTransform(position.Item1, position.Item2, out cx, out cy);
+
+                            // 视口裁剪：屏幕外的图形连绘制调用都不发出去
+                            if ((cx + halfW) < view.Left || (cx - halfW) > view.Right ||
+                                (cy + halfH) < view.Top || (cy - halfH) > view.Bottom)
+                            {
+                                continue;
+                            }
+
+                            if (tier == 1)
+                            {
+                                // 简化档：**同尺寸**实心方块（边长 = 图形自己的外接框）。
+                                // 尺寸不变，只抹掉"圆 / 椭圆"这层形状细节 —— 5px 以下反正看不出来，
+                                // 而单次成本只有精确描边的 1/3~1/4（见方法头上方的实测表）。
+                                ctx.DispRectangle1(cy - halfH, cx - halfW, cy + halfH, cx + halfW);
+                            }
+                            else if (aperture.Shape == ApertureShape.Circle)
+                            {
+                                ctx.DispCircle(cy, cx, aperture.Diameter / 2.0);
+                            }
+                            else if (aperture.Shape == ApertureShape.Rectangle)
+                            {
+                                ctx.DispRectangle1(cy - halfH, cx - halfW, cy + halfH, cx + halfW);
+                            }
+                            else if (aperture.Shape == ApertureShape.Oval)
+                            {
+                                ctx.DispEllipse2(cy, cx, aperture.Rotation * Math.PI / 180.0,
+                                                 aperture.Width / 2.0, aperture.Height / 2.0);
+                            }
                         }
                     }
                 }
@@ -2508,6 +2614,55 @@ namespace GerberParserSmartV4._0
                 KLog.Error("计算内容包围盒失败", ex);
                 _contentBounds = RectangleF.Empty;
             }
+        }
+
+        /// <summary>
+        /// 从 App.config（编译后是 exe 旁的 `GerberParserSmartV4.0.exe.config`）读**视图缩放上限**。
+        ///
+        /// 【为什么需要它】缩放限幅的默认值在控件库里（`KWindowOptions`：MinScale 0.01 / MaxScale 500），
+        /// 而 500 对"**小板铺满大画布**"这种场景不够用 —— 例：`Broad\q02578f045a00` 的
+        /// 包围盒只有 **8.7 × 5.2 世界单位**，在 1600×900 画布上 `FitToWindow` 之后
+        /// scale 就已经 ≈150，滚轮再放大三五下就撞到 500 的天花板。
+        ///
+        /// 【口径】`Scale` 的语义是"**世界单位 → 屏幕像素**"的比例（`1.0` = 1:1），
+        /// **不是**"相对 1:1 的倍数"。状态栏那个 `150.000×` 里的 `×` 只是装饰 ——
+        /// 意思是 1 个世界单位（本工程里是 mm）占 150 个屏幕像素。
+        ///
+        /// 【容错】配置缺失 / 非数字 / ≤0 / NaN 一律**不设**（`ReadPositiveSetting` 返回 0），
+        /// 保持控件库默认 —— 与 `KViewport` 自己"≤0 或 NaN 会被忽略"的口径一致。
+        /// 绝不能因为写错一个值就把上限设成 0（那会让视图卡死在某一级）。
+        /// </summary>
+        private void ApplyViewScaleLimits()
+        {
+            double max = ReadPositiveSetting("ViewMaxScale");
+            if (max > 0) kWindowControl1.Viewport.MaxScale = max;
+
+            KLog.Info($"视图缩放上限：MaxScale={kWindowControl1.Viewport.MaxScale}" +
+                      (max > 0 ? "（来自 App.config 的 ViewMaxScale）" : "（控件库默认 500）"));
+        }
+
+        /// <summary>
+        /// 读一个"正数"配置项。取不到 / 解析失败 / 非正数 → 返回 0（调用方据此走默认值）。
+        /// 刻意**不抛异常**：配置写错不该让程序起不来。
+        /// </summary>
+        private static double ReadPositiveSetting(string key)
+        {
+            try
+            {
+                string raw = ConfigurationManager.AppSettings[key];
+                double v;
+                if (!string.IsNullOrEmpty(raw) &&
+                    double.TryParse(raw.Trim(), out v) &&
+                    v > 0 && !double.IsNaN(v) && !double.IsInfinity(v))
+                {
+                    return v;
+                }
+            }
+            catch (Exception ex)
+            {
+                KLog.Error($"读取配置项 {key} 失败（按未配置处理）", ex);
+            }
+            return 0;
         }
 
         private void UpdateScaleLabel()

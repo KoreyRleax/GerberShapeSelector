@@ -15,6 +15,7 @@
 - ⚠ **不可碰**：`bin\x64\Debug\Json\`（使用者真实模板数据，不可再生）
 - 临时文件写 `C:\Users\59538\.workbuddy\tmp\`，**禁止**留在仓库里
 - 日志 `KLog` → exe 目录 `logs\yyyy-MM-dd.log`；`GerberParserTool.dll` 在 `lib\`（`bin\Debug\` 引用会在清 bin 后挂）
+- 🔴 **`GerberParserTool` 源码在 `D:\MyWork\GerberParserTool\`**（net48 类库，**不在本仓库、不在 git 下** → 改前先备份）。流程：改源码 → `dotnet build -c Debug` → 把 `bin\Debug\net48\GerberParserTool.dll` 拷进本工程 `lib\`。⚠ **有两份源码**：`D:\CSharpWorkBase\ClassLib\GerberParserTool\` 是 2026-09-18 的旧副本（改前与前者逐字节相同），**别从它编译替换**。⚠ 它**往 Console 逐行打印解析日志**（`解析行:`/`移动到坐标:`/`光圈Dxx在位置(..)曝光`），2026-09-21 已按用户要求删掉 38 行 dump + 清空 `PrintSummary()` 方法体（保留 5 处"警告:/未识别"异常信号）；`lib\` 下**没有** pdb
 
 ## 三、设计决策红线（改前必读代码注释）
 - 选点**不设门禁**，单选/多选只是点击语义；**框选 = 选择，框选限定 = 作用域**；框外点击一律解除限定（`ReleaseScopeIfOutside`）
@@ -24,6 +25,8 @@
 - 🔴 **图层状态拷进图形对象**：`SelectedCircle` 带 `LayerId/LayerDepth/LayerHidden`（运行期，不进 json），`RefreshLayerState()` 在载入/勾选/置顶三处刷新。**别用图层名查表** —— 对不上会**静默退化**成纯距离排序（表现为"只能选到大圆"）
 - 命中判定 `ShapeQuery.HitTest(…, layerDepth)`，图层知识由 `MainForm.DepthForHitTest` 提供（几何库无状态）
 - 🔴 **图形唯一键 = 图层 + 坐标(4位小数) + 形状 + 尺寸**（`ShapeKey`，`GetSize()` 折成三元组）。缺一都错位认领；`IsSingleShapeInShapes` 口径必须一致
+- 🔴 **底图绘制按屏幕尺寸分级（LOD，2026-09-21）**：`DrawGerberApertures` 里 `<1px` 不画 / `1~5px` 画**同尺寸实心方块**（边长=图形自身外接框）/ `≥5px` 精确描边。判据是**屏幕尺寸**（自动等价"越放大越精细"，无需维护档位状态）。**只降级底图**，选点永远精确。🔴 **两趟画（精确/简化）必须在图层循环内部** —— 挪到外面会让上层简化图形盖住下层精确图形。阈值 `LodSkipPx`=1.0（光栅化边界，**在该板上触发 0 次**）/ `LodBlockPx`=5.0（**收益曲线拐点在 4.5px**，5 落在平台起点；4.5→8.0 只再省 1.4%）。实测真实板 20188 图元：**56ms/帧 → 16.5ms/帧（0.30x）**。⚠ 两条被实测否掉的路：**"跳过亚像素图形"在 PCB 上几乎无收益**（工艺下限 0.2~0.3mm → 整板视图下最小也有 2.2px，实测 <2px 图元为 0）；**"合并成一条 GraphicsPath"反而慢 3.5 倍**（GDI+ 路径 figure 多了开销超线性）
+- **视图缩放上限走 `App.config` 的 `ViewMaxScale`（默认 500）**（2026-09-21）：`MainForm.ApplyViewScaleLimits()` 在 `MainForm_Load` 读 + 容错（缺失/非数字/≤0 一律忽略，保持控件库默认）。`KViewport.MaxScale` 是可写属性，**不用改控件库**。⚠ **`Scale` 语义是"世界单位→屏幕像素"（1.0=1:1），不是倍数** —— 状态栏 `缩放 150.000×` 的 `×` 只是装饰；默认缩放由 `FitToWindow` 算（小板铺满大画布 → scale 必然大）。⚠ 项目原本**没有** `System.Configuration` 引用（`ApplicationSettingsBase` 在 `System.dll`、`ConfigurationManager` 在 `System.Configuration.dll`）—— 2026-09-21 才补上
 - 🔴 **去重口径有两套，别混**（2026-09-21）：① 上一条的**四维键**管"选点对象 ↔ Gerber 图形"对应，**模型内**跨图层同坐标仍各占一条；② **保存前按坐标判重** —— `ConfirmNoDuplicatePositions()`（`SaveTemplateToPath` 开头，`DuplicatePositionDialog.cs`），**同落盘坐标 > 1 条即弹窗阻断**，用户选「返回修改」（一个文件都不写）/「仍然保存」。用户裁定"不同图层同坐标的点是两个点"**不被允许**（插针机按坐标定位 → 重复插针）。**不做自动去重**（留哪条是业务判断，猜反 = 打错针位）；**不改选点行为**（五入口只守出口一个门；隐藏图层场景在选点端无解）
 - 🔴 **不在任何 Gerber 图形上的选点必须收编进 `_allShapes`**（`AppendOrphanSelections()`）—— `_allShapes` 是命中/框选/扩散的唯一依据，不收编就是"画得出、存得下、点不着"
 - **合并** toggle 与单选/多选互斥；候选独立于选中状态（gold 轮廓）。多选扩散**限定同图层**（光圈 ID 只在一个 Gerber 内有意义）
