@@ -776,6 +776,18 @@ namespace GerberParserSmartV4._0
             // 视口变化（缩放 / 平移 / 适配）→ 刷新状态栏。
             // 放在这里而不是绘制回调里，是为了避免"绘制 → 改 UI → 重绘"的递归。
             UpdateScaleLabel();
+
+            // ⚠ 还必须让**子控件**（画布上那两块半透明浮层：顶部工具栏 / 右上角图层容器）
+            //    跟着一起重绘。
+            //
+            // 控件内部只调了 `Invalidate()`（**无参 = 不失效子控件**，见 KWindowControl.cs:235），
+            // 而浮层是**半透明**的 —— 它靠"父控件在自己的 DC 上补画底下那块内容"来显示
+            // （控件库的透明链，见 OverlayToolbar.cs:14-22）。不失效子控件的话，
+            // 浮层覆盖的那块会**停在缩放前的旧画面上**，直到它因别的原因才重绘 ——
+            // 用户看到的就是"浮层下方的图形滞后 / 跳一下"。
+            //
+            // 反复 Invalidate 只是**标脏**，会在下一个 WM_PAINT 里合并成一次，不会多画一遍。
+            kWindowControl1.Invalidate(true);
         }
 
         private void MainForm_Load(object sender, EventArgs e)
@@ -900,6 +912,40 @@ namespace GerberParserSmartV4._0
         private bool _syncingBaseLayer = false;
 
         /// <summary>
+        /// 开了**双缓冲**的浮层容器（工具栏与图层容器都用它）。
+        ///
+        /// 【为什么需要它 —— 浮层下方图形闪烁的根因】
+        /// 画布 `KWindowControl` 自带 `ControlStyles.OptimizedDoubleBuffer`
+        /// （见 `KWindowControl.cs:116`）→ 先画进内存位图再一次性 blit，**所以画布本体不闪**。
+        /// 而浮层 `OverlayToolbar` **没有开双缓冲**（它只设了 `SupportsTransparentBackColor`，
+        /// 见 `OverlayToolbar.cs:57`）；`Panel` / `FlowLayoutPanel` 的默认值是 `false`。
+        ///
+        /// 偏偏浮层是**半透明**的（`KWindowOptions.ToolbarBackColor` 带 alpha）——
+        /// WinForms 的"透明"是**绘制模拟**：浮层重绘时要先回调**父控件（画布）的
+        /// OnPaintBackground** 把底下那块内容画出来，再叠自己的半透明底
+        /// （见 `OverlayToolbar.cs:14-22` 的"透明链"说明）。
+        /// 这两步在没有双缓冲时**是直接往屏幕上画的** → 在"父内容只画了一半"的窗口期里，
+        /// 浮层覆盖的那块就会露出中间态 —— 表现为**浮层下方的图形在闪**。
+        /// （画布本体有缓冲、不闪，对比之下那块区域反而更显眼。）
+        ///
+        /// 【为什么用子类，而不是直接改控件库】
+        /// `Control.DoubleBuffered` 是 **protected** 的，外部设不了，子类是唯一的最小代价做法。
+        /// 另一个选择是改 `OverlayToolbar` 的构造函数加一行 `DoubleBuffered = true;` ——
+        /// 那会**同时影响所有引用该 dll 的工程**（`Korey.SmartWindow` 是共享自研库），
+        /// 属于共享库变更，先留在本工程侧解决。
+        ///
+        /// 【代价】浮层各多占一块内存位图（几十 × 几百像素），可忽略；无观感变化。
+        /// </summary>
+        private sealed class DoubleBufferedOverlayToolbar : OverlayToolbar
+        {
+            public DoubleBufferedOverlayToolbar()
+            {
+                // 半透明浮层 + 无缓冲 = 闪烁；这一行就是全部修复。
+                DoubleBuffered = true;
+            }
+        }
+
+        /// <summary>
         /// 构建贴在画布上沿的悬浮工具栏。
         ///
         /// 取舍：这里只放**高频、且与"看图 / 选点"直接相关**的动作 —— 手不用离开画布。
@@ -908,7 +954,7 @@ namespace GerberParserSmartV4._0
         /// </summary>
         private void BuildOverlayToolbar()
         {
-            _overlayToolbar = new OverlayToolbar();
+            _overlayToolbar = new DoubleBufferedOverlayToolbar();
 
             // ① 点击语义：单选 / 多选（互斥的两个 toggle）
             _btnSingleMode = _overlayToolbar.AddToggleButton("单选", true, (s, e) => SetClickMode(true));
@@ -970,7 +1016,7 @@ namespace GerberParserSmartV4._0
         /// </summary>
         private void BuildLayerPanel()
         {
-            _layerPanel = new OverlayToolbar();
+            _layerPanel = new DoubleBufferedOverlayToolbar();
             _layerPanel.FlowDirection = FlowDirection.TopDown;   // 横条 → 纵列表
             _layerPanel.WrapContents = false;
             _layerPanel.AutoSize = true;
@@ -2673,7 +2719,7 @@ namespace GerberParserSmartV4._0
             // 原实现把这块信息写在窗体左上角的 label1 —— 9pt 小字、离操作处很远，实际没人看。
             // 现在拆成状态栏右侧的固定位：左侧消息区（Spring=true 占满剩余宽度）留给瞬时消息，
             // 这三个标签紧贴右边，互不挤占。
-            lblView.Text = $"缩放 {kWindowControl1.Scale:F3}× | 可见 {visible.Width:F0}×{visible.Height:F0}";
+            lblView.Text = $"缩放 {kWindowControl1.Scale:F3} px/单位 | 可见 {visible.Width:F0}×{visible.Height:F0}";
 
             UpdateProjectLabel();
         }
@@ -2787,7 +2833,15 @@ namespace GerberParserSmartV4._0
                 {
                     // 不再需要"刷新两次"：那是原来 ClearWindow + 每帧重建几何
                     // 与 WM_PAINT 交错导致的时序问题；GDI+ 自绘路径没有这个问题。
-                    kWindowControl1.Refresh();
+                    //
+                    // 用 Invalidate 而**不是** Refresh：Refresh = Invalidate(true) + Update()，
+                    // 其中 Update() 会**同步**把 WM_PAINT 处理完才返回 —— 数据变化后若紧接着
+                    // 还有消息（连续点选、批量操作逐项刷新），每一次都要等一整帧画完，
+                    // 中间没有"合并多次重绘"的机会。Invalidate 是标脏，交给消息循环合并。
+                    //
+                    // ⚠ 参数仍是 **true**（失效子控件）：画布上那两块半透明浮层必须跟着重画，
+                    //    理由同 OnViewChanged 里的说明（控件库的透明链）。
+                    kWindowControl1.Invalidate(true);
                 }
             }
             catch (Exception ex)
